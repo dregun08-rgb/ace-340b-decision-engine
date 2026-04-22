@@ -1,0 +1,9 @@
+metric,value
+Total claims imported,8058.0
+PASS claims,0.0
+REVIEW claims,8058.0
+Pass rate,0.0
+High risk claims,8058.0
+Medium risk claims,0.0
+Low risk claims,0.0
+Average risk score,37.74013402829486
