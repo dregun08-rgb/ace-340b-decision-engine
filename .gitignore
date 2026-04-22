@@ -8,3 +8,4 @@ rules_config.json
 dist/
 build/
 .env
+.streamlit/secrets.toml

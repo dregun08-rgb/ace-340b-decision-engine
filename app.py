@@ -24,6 +24,28 @@ from ace_340b_audit.report import generate_html_report
 
 st.set_page_config(page_title="ACE 340B Decision Engine", page_icon="⚕️", layout="wide")
 
+# ── password gate ─────────────────────────────────────────────────────────────
+def _check_password() -> bool:
+    """Returns True once the correct password has been entered."""
+    correct = st.secrets.get("APP_PASSWORD", "")
+    if not correct:          # no secret set → open access (local dev)
+        return True
+    if st.session_state.get("_authenticated"):
+        return True
+    st.markdown("## ⚕️ ACE 340B Decision Engine")
+    st.markdown("Enter the access password to continue.")
+    pwd = st.text_input("Password", type="password", key="_pwd_input")
+    if st.button("Enter", key="_pwd_btn"):
+        if pwd == correct:
+            st.session_state["_authenticated"] = True
+            st.rerun()
+        else:
+            st.error("Incorrect password.")
+    return False
+
+if not _check_password():
+    st.stop()
+
 # ── disclaimer banner ─────────────────────────────────────────────────────────
 st.info(
     "⚕️  **ACE 340B Decision Engine** — Corrective action guidance is based on HRSA programme "
