@@ -68,19 +68,25 @@ CATEGORY_ORDER = [DUPLICATE_DISCOUNT, INELIGIBLE_PRESCRIBER, WRONG_SITE,
 # ── sidebar ───────────────────────────────────────────────────────────────────
 
 st.sidebar.header("Data inputs")
-uploaded_file        = st.sidebar.file_uploader("340B workbook (.xlsx)", type=["xlsx"])
+uploaded_file = st.sidebar.file_uploader(
+    "340B workbook (.xlsx) ✳ Required",
+    type=["xlsx"],
+    help="Excel workbook with sheets: Raw_Data, Store_Map, Site_Entity_Map.",
+)
+st.sidebar.caption("All files below are optional — the audit runs without them.")
 provider_master_file = st.sidebar.file_uploader(
-    "Provider master CSV (HRSA-eligible NPI list)",
+    "Provider master CSV (optional)",
     type=["csv"],
     help="CSV with 'NPI' or 'Provider NPI' column. Unlocks Ineligible Prescriber detection.",
 )
 mef_file = st.sidebar.file_uploader(
-    "Medicaid Exclusion File (MEF) CSV / Excel",
+    "Medicaid Exclusion File — MEF (optional)",
     type=["csv", "xlsx", "xls"],
     help=(
         "HRSA's Medicaid Exclusion File listing covered entities that use 340B drugs "
-        "for Medicaid FFS patients. Required columns: '340B ID' and optionally 'State', "
-        "'Active'. Download from https://340bopais.hrsa.gov or use the template below."
+        "for Medicaid FFS patients. Optional — audit runs without it, but MEF cross-reference "
+        "and Duplicate Discount MEF flags will show N/A. "
+        "Required columns: '340B ID' and optionally 'State', 'Active'."
     ),
 )
 st.sidebar.download_button(
@@ -91,7 +97,7 @@ st.sidebar.download_button(
     help="Fill with your entity's 340B IDs and Medicaid Provider NPIs from HRSA OPA.",
 )
 exceptions_file = st.sidebar.file_uploader(
-    "Exceptions CSV",
+    "Exceptions CSV (optional)",
     type=["csv"],
     help="CSV with 'Prescription number' column. Approved claims become EXCEPTION status.",
 )
