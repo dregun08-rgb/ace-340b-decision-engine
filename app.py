@@ -75,8 +75,8 @@ provider_master_file = st.sidebar.file_uploader(
     help="CSV with 'NPI' or 'Provider NPI' column. Unlocks Ineligible Prescriber detection.",
 )
 mef_file = st.sidebar.file_uploader(
-    "Medicaid Exclusion File (MEF) CSV",
-    type=["csv"],
+    "Medicaid Exclusion File (MEF) CSV / Excel",
+    type=["csv", "xlsx", "xls"],
     help=(
         "HRSA's Medicaid Exclusion File listing covered entities that use 340B drugs "
         "for Medicaid FFS patients. Required columns: '340B ID' and optionally 'State', "
@@ -203,7 +203,21 @@ def _write_temp(data: bytes, suffix: str) -> str:
 
 source_path: str | None = None
 if uploaded_file is not None:
-    source_path = _write_temp(uploaded_file.getbuffer().tobytes(), ".xlsx")
+    # Persist temp file path for the lifetime of this upload so re-runs don't
+    # create a new path (which would bust @st.cache_data on _load_results).
+    file_id = uploaded_file.file_id
+    if st.session_state.get("_wb_file_id") != file_id:
+        wb_bytes = uploaded_file.getbuffer().tobytes()
+        # Reject non-Excel uploads with a clear message
+        if not wb_bytes[:4] in (b"PK\x03\x04", b"\xd0\xcf\x11\xe0"):
+            st.error(
+                "⚠️  The uploaded file does not appear to be an Excel workbook (.xlsx / .xls). "
+                "Please upload the 340B claims workbook in Excel format."
+            )
+            st.stop()
+        st.session_state["_wb_file_id"] = file_id
+        st.session_state["_wb_path"]    = _write_temp(wb_bytes, ".xlsx")
+    source_path = st.session_state["_wb_path"]
 elif DEFAULT_SAMPLE.exists():
     source_path = str(DEFAULT_SAMPLE)
     st.sidebar.success("Loaded bundled MAP sample workbook")
@@ -213,13 +227,23 @@ else:
 
 provider_master_df: pd.DataFrame | None = None
 if provider_master_file is not None:
-    provider_master_df = pd.read_csv(provider_master_file)
-    st.sidebar.success(f"Provider master: {len(provider_master_df):,} records")
+    try:
+        provider_master_df = pd.read_csv(provider_master_file)
+        st.sidebar.success(f"Provider master: {len(provider_master_df):,} records")
+    except Exception as _e:
+        st.sidebar.warning(f"Could not read provider master: {_e}")
 
 mef_df: pd.DataFrame | None = None
 if mef_file is not None:
-    mef_df = pd.read_csv(mef_file)
-    st.sidebar.success(f"MEF loaded: {len(mef_df):,} entities")
+    try:
+        _mef_name = mef_file.name.lower()
+        if _mef_name.endswith((".xlsx", ".xls")):
+            mef_df = pd.read_excel(mef_file)
+        else:
+            mef_df = pd.read_csv(mef_file)
+        st.sidebar.success(f"MEF loaded: {len(mef_df):,} entities")
+    except Exception as _e:
+        st.sidebar.warning(f"Could not read MEF file: {_e}")
 
 exceptions_df: pd.DataFrame | None = None
 if exceptions_file is not None:
@@ -250,7 +274,22 @@ mef_json   = mef_df.to_json()             if mef_df             is not None else
 exc_json   = exceptions_df.to_json()      if exceptions_df       is not None else None
 
 with st.spinner("Running decision engine…"):
-    cached  = _load_results(source_path, pm_json, mef_json, exc_json, rules_json, carve_status)
+    try:
+        cached = _load_results(source_path, pm_json, mef_json, exc_json, rules_json, carve_status)
+    except ValueError as _ve:
+        _msg = str(_ve)
+        if "not found" in _msg.lower() or "worksheet" in _msg.lower():
+            st.error(
+                "⚠️  **Workbook sheet not found.** Your Excel file must contain sheets named exactly: "
+                "`Raw_Data`, `Store_Map`, `Site_Entity_Map`. "
+                f"Detail: {_msg}"
+            )
+        else:
+            st.error(f"⚠️  Error reading workbook: {_msg}")
+        st.stop()
+    except Exception as _exc:
+        st.error(f"⚠️  Unexpected error running audit: {_exc}")
+        st.stop()
 
 results        = _reconstruct(cached)
 claims         = results["claims"]
