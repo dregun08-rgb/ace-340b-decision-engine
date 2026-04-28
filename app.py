@@ -256,7 +256,8 @@ if uploaded_file is not None:
     # Persist temp file path for the lifetime of this upload so re-runs don't
     # create a new path (which would bust @st.cache_data on _load_results).
     file_id = uploaded_file.file_id
-    if st.session_state.get("_wb_file_id") != file_id:
+    if (st.session_state.get("_wb_file_id") != file_id
+            or "_wb_format" not in st.session_state):
         wb_bytes = uploaded_file.getbuffer().tobytes()
         fname    = uploaded_file.name.lower()
         if fname.endswith(".csv"):

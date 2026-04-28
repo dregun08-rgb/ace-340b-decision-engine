@@ -96,7 +96,14 @@ def map_rx_log(
         .unique()
         .tolist()
     )
-    store_map = pd.DataFrame({"Store number": stores})
+    store_map = pd.DataFrame({
+        "Store number":           stores,
+        # Pre-populate location fields from the store ID so they appear in
+        # audit output; 340B ID / Covered entity left blank until configured.
+        "Pharmacy location":      stores,
+        "Site location":          stores,
+        "Patient encounter site": stores,
+    })
 
     # ── Site_Entity_Map: minimal — entity match will be REVIEW until user
     #    populates 340B ID / Covered entity via the store map upload ──────────
