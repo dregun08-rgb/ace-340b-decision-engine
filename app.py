@@ -333,12 +333,21 @@ if exceptions_file is not None:
 @st.cache_data(show_spinner=False)
 def _load_results(path, pm_json, mef_json, exc_json, rules_json, carve, fmt="excel") -> dict:
     rules = json.loads(rules_json)
-    pm    = pd.read_json(pm_json)  if pm_json  else None
-    mef   = pd.read_json(mef_json) if mef_json else None
-    exc   = pd.read_json(exc_json) if exc_json else None
+
+    def _rj(j):
+        df = pd.read_json(j)
+        return df.astype({c: object for c in df.columns})
+
+    pm    = _rj(pm_json)  if pm_json  else None
+    mef   = _rj(mef_json) if mef_json else None
+    exc   = _rj(exc_json) if exc_json else None
 
     if fmt == "csv":
         raw_df = pd.read_csv(path, dtype=str, low_memory=False)
+        # Streamlit Cloud uses PyArrow-backed dtypes by default; arithmetic on
+        # bool[pyarrow] + int64 raises 'radd not supported'. Convert every
+        # column to plain numpy object dtype before entering the engine.
+        raw_df = raw_df.astype({c: object for c in raw_df.columns})
         if not detect_rx_log(raw_df):
             raise ValueError(
                 "CSV does not match the expected RX-log format. "
