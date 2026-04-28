@@ -65,6 +65,30 @@ EXCEPTIONS_TEMPLATE_COLS = ["Prescription number", "Exception reason", "Reviewed
 CATEGORY_ORDER = [DUPLICATE_DISCOUNT, INELIGIBLE_PRESCRIBER, WRONG_SITE,
                   MISSING_ENCOUNTER, DATA_MISMATCH, COMPLIANT]
 
+# ── provider registry (persisted to disk) ─────────────────────────────────────
+_PROVIDER_REGISTRY = Path(__file__).resolve().parent / "provider_registry.json"
+
+def _load_registry() -> pd.DataFrame | None:
+    """Load saved provider registry from disk; returns None if not present."""
+    if _PROVIDER_REGISTRY.exists():
+        try:
+            df = pd.read_json(_PROVIDER_REGISTRY, dtype=str)
+            if not df.empty and "NPI" in df.columns:
+                return df
+        except Exception:
+            pass
+    return None
+
+def _save_registry(df: pd.DataFrame) -> None:
+    """Persist provider registry to disk and clear the cached resource."""
+    df.to_json(_PROVIDER_REGISTRY, orient="records")
+    _cached_registry.clear()
+
+@st.cache_resource
+def _cached_registry():
+    """Cache the registry across reruns so it isn't re-read every script run."""
+    return {"df": _load_registry()}
+
 
 # ── sidebar ───────────────────────────────────────────────────────────────────
 
@@ -79,10 +103,24 @@ uploaded_file = st.sidebar.file_uploader(
     ),
 )
 st.sidebar.caption("All files below are optional — the audit runs without them.")
+
+# Show registry status in sidebar
+_registry_df = _cached_registry()["df"]
+if _registry_df is not None and not _registry_df.empty:
+    st.sidebar.success(
+        f"👨‍⚕️ Provider registry: {len(_registry_df):,} providers in memory. "
+        "Ineligible Prescriber check is active."
+    )
+else:
+    st.sidebar.info("👨‍⚕️ No provider registry saved. Go to the Provider Registry tab to add your site providers.")
+
 provider_master_file = st.sidebar.file_uploader(
-    "Provider master CSV (optional)",
+    "Provider master CSV — one-time upload (optional)",
     type=["csv"],
-    help="CSV with 'NPI' or 'Provider NPI' column. Unlocks Ineligible Prescriber detection.",
+    help=(
+        "CSV with 'NPI' or 'Provider NPI' column for a one-time session upload. "
+        "To persist providers across sessions, use the Provider Registry tab."
+    ),
 )
 mef_file = st.sidebar.file_uploader(
     "Medicaid Exclusion File — MEF (optional)",
@@ -249,11 +287,26 @@ else:
     st.warning("Upload a 340B workbook to begin.")
     st.stop()
 
-provider_master_df: pd.DataFrame | None = None
+# Build provider_master_df: registry (persisted) + optional session upload, merged
+provider_master_df: pd.DataFrame | None = _cached_registry()["df"]
+
 if provider_master_file is not None:
     try:
-        provider_master_df = pd.read_csv(provider_master_file)
-        st.sidebar.success(f"Provider master: {len(provider_master_df):,} records")
+        _upload_pm = pd.read_csv(provider_master_file)
+        if provider_master_df is not None and not provider_master_df.empty:
+            # Merge session upload on top of registry (union, deduplicated)
+            provider_master_df = (
+                pd.concat([provider_master_df, _upload_pm], ignore_index=True)
+                .drop_duplicates(subset=["NPI"])
+                .reset_index(drop=True)
+            )
+            st.sidebar.success(
+                f"Provider master: {len(provider_master_df):,} records "
+                f"(registry + {len(_upload_pm):,} from upload)"
+            )
+        else:
+            provider_master_df = _upload_pm
+            st.sidebar.success(f"Provider master: {len(provider_master_df):,} records (session upload)")
     except Exception as _e:
         st.sidebar.warning(f"Could not read provider master: {_e}")
 
@@ -413,6 +466,96 @@ else:
 
 st.markdown("---")
 
+# ── Pharmacy Risk Scorecard ────────────────────────────────────────────────────
+
+def _risk_grade(score: float) -> tuple[str, str, str]:
+    """Return (grade, label, hex_color) for a 0-100 risk score."""
+    if score >= 90: return "A", "Excellent",        "#27ae60"
+    if score >= 80: return "B", "Good",             "#2ecc71"
+    if score >= 70: return "C", "Acceptable",       "#f39c12"
+    if score >= 60: return "D", "Needs Improvement","#e67e22"
+    return             "F", "Critical Risk",    "#e74c3c"
+
+_pharmacy_score = float(m.get("Average risk score", 0))
+_grade, _label, _grade_color = _risk_grade(_pharmacy_score)
+_bar_pct = max(2, int(_pharmacy_score))
+_bar_color = _grade_color
+
+# Breakdowns for the scorecard detail line
+_n_total    = int(m.get("Total claims imported", 0))
+_n_review   = int(m.get("REVIEW claims", 0))
+_n_high     = int(m.get("High risk claims", 0))
+_n_dd       = int(m.get("Duplicate Discount", 0))
+_n_ws       = int(m.get("Wrong Site", 0))
+_n_ip       = int(m.get("Ineligible Prescriber", 0))
+_n_me       = int(m.get("Missing Encounter", 0))
+_n_dm       = int(m.get("Data Mismatch", 0))
+_review_pct = (_n_review / _n_total * 100) if _n_total else 0
+
+_deficiency_bits = []
+if _n_dd: _deficiency_bits.append(f"🚨 {_n_dd:,} Duplicate Discount")
+if _n_ip: _deficiency_bits.append(f"⚕️ {_n_ip:,} Ineligible Prescriber")
+if _n_ws: _deficiency_bits.append(f"🏥 {_n_ws:,} Wrong Site")
+if _n_me: _deficiency_bits.append(f"🔍 {_n_me:,} Missing Encounter")
+if _n_dm: _deficiency_bits.append(f"📋 {_n_dm:,} Data Mismatch")
+_deficiency_str = " &nbsp;·&nbsp; ".join(_deficiency_bits) if _deficiency_bits else "No deficiencies detected"
+
+st.markdown(
+    f"""
+    <div style="background:#1a2e4a;border-radius:12px;padding:22px 28px;margin:4px 0 18px 0">
+      <div style="color:#8daabf;font-size:0.75em;text-transform:uppercase;
+                  letter-spacing:1.5px;margin-bottom:6px">Pharmacy Compliance Risk Score</div>
+      <div style="display:flex;align-items:flex-end;gap:20px;flex-wrap:wrap">
+        <div>
+          <span style="font-size:3.6em;font-weight:800;color:{_grade_color};line-height:1">
+            {_pharmacy_score:.0f}
+          </span>
+          <span style="color:#8daabf;font-size:1.1em;margin-left:4px">/ 100</span>
+        </div>
+        <div style="margin-bottom:6px">
+          <div style="font-size:1.6em;font-weight:700;color:{_grade_color}">
+            Grade {_grade} &nbsp;—&nbsp; {_label}
+          </div>
+          <div style="color:#8daabf;font-size:0.85em">
+            {_review_pct:.1f}% of claims flagged for review &nbsp;·&nbsp;
+            {_n_high:,} high-risk claims
+          </div>
+        </div>
+      </div>
+      <div style="background:#0d1e30;border-radius:8px;height:14px;
+                  overflow:hidden;margin:14px 0 6px 0">
+        <div style="background:linear-gradient(90deg,{_grade_color}cc,{_grade_color});
+                    width:{_bar_pct}%;height:100%;border-radius:8px;
+                    transition:width 0.5s"></div>
+      </div>
+      <div style="display:flex;justify-content:space-between;
+                  color:#4a6a84;font-size:0.72em;margin-bottom:12px">
+        <span>0 — Critical</span><span>50</span><span>100 — Fully Compliant</span>
+      </div>
+      <div style="color:#8daabf;font-size:0.82em">{_deficiency_str}</div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+# Per-store risk scores (visible when multiple stores or always as a reference row)
+_store_scores = store_status[["Store number","scripts","review_claims","avg_risk_score","review_rate"]].copy()
+_store_scores["Risk grade"] = _store_scores["avg_risk_score"].apply(lambda s: _risk_grade(float(s))[0])
+_store_scores["Risk label"] = _store_scores["avg_risk_score"].apply(lambda s: _risk_grade(float(s))[1])
+_store_scores["avg_risk_score"] = _store_scores["avg_risk_score"].round(1)
+_store_scores["review_rate"]    = (_store_scores["review_rate"] * 100).round(1).astype(str) + "%"
+_store_scores = _store_scores.rename(columns={
+    "scripts":        "Total claims",
+    "review_claims":  "Review claims",
+    "avg_risk_score": "Avg risk score",
+    "review_rate":    "Review rate",
+})
+
+with st.expander("Store risk scores", expanded=(len(_store_scores) > 1)):
+    st.dataframe(_store_scores, width="stretch")
+
+st.markdown("---")
+
 # ── charts ─────────────────────────────────────────────────────────────────────
 
 ch_left, ch_right = st.columns([1.2, 1])
@@ -436,11 +579,12 @@ st.markdown("---")
 # TABS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-tab_queue, tab_all, tab_store, tab_exc, tab_dl = st.tabs([
+tab_queue, tab_all, tab_store, tab_exc, tab_prov, tab_dl = st.tabs([
     "⚠️ Review Queue",
     "📄 All Claims",
     "🏪 Store Status",
     "📋 Exception Management",
+    "👨‍⚕️ Provider Registry",
     "⬇ Downloads",
 ])
 
@@ -523,10 +667,32 @@ with tab_queue:
         )
         st.caption(CATEGORY_DESCRIPTIONS.get(selected_bucket, ""))
 
+        # Bucket-level risk summary line
+        _b_avg  = bucket_df["Risk score"].astype(float).mean() if len(bucket_df) else 0
+        _b_grade, _b_label, _b_color = _risk_grade(_b_avg)
+        _b_high = int((bucket_df["Risk tier"] == "High").sum())   if "Risk tier" in bucket_df.columns else 0
+        _b_med  = int((bucket_df["Risk tier"] == "Medium").sum()) if "Risk tier" in bucket_df.columns else 0
+        st.markdown(
+            f"<div style='background:#f8f9fa;border:1px solid #dee2e6;"
+            f"border-radius:8px;padding:10px 16px;margin:6px 0 10px 0;"
+            f"display:flex;gap:32px;align-items:center'>"
+            f"<div><span style='color:#666;font-size:0.78em'>Bucket avg risk score</span><br>"
+            f"<span style='font-size:1.6em;font-weight:800;color:{_b_color}'>{_b_avg:.0f}</span>"
+            f"<span style='color:#888;font-size:0.85em'> / 100 &nbsp; Grade {_b_grade} — {_b_label}</span></div>"
+            f"<div><span style='color:#666;font-size:0.78em'>High risk</span><br>"
+            f"<span style='font-size:1.3em;font-weight:700;color:#e74c3c'>{_b_high:,}</span></div>"
+            f"<div><span style='color:#666;font-size:0.78em'>Medium risk</span><br>"
+            f"<span style='font-size:1.3em;font-weight:700;color:#e67e22'>{_b_med:,}</span></div>"
+            f"<div><span style='color:#666;font-size:0.78em'>Claims in bucket</span><br>"
+            f"<span style='font-size:1.3em;font-weight:700;color:#1a2e4a'>{len(bucket_df):,}</span></div>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
         BUCKET_COLS = [
+            "Risk score", "Risk tier",
             "Prescription number", "Fill date", "Drug name",
             "Prescribing provider", "Provider NPI", "Store number",
-            "Risk score", "Risk tier",
             "Duplicate reason", "NDC check", "NPI check",
             "Encounter date check", "Missing fields list",
         ]
@@ -645,8 +811,75 @@ with tab_all:
 # ── TAB 3: Store Status ───────────────────────────────────────────────────────
 
 with tab_store:
-    st.subheader("Store performance")
-    st.dataframe(store_status, width="stretch", height=400)
+    st.subheader("Store performance & risk scores")
+
+    # Enrich store_status with grade columns for display
+    _ss_display = store_status.copy()
+    _ss_display["Risk score"] = _ss_display["avg_risk_score"].round(1)
+    _ss_display["Grade"]      = _ss_display["avg_risk_score"].apply(lambda s: _risk_grade(float(s))[0])
+    _ss_display["Risk level"] = _ss_display["avg_risk_score"].apply(lambda s: _risk_grade(float(s))[1])
+    _ss_display["Review rate"] = (_ss_display["review_rate"] * 100).round(1).astype(str) + "%"
+    _ss_display = _ss_display.rename(columns={
+        "scripts":       "Total claims",
+        "review_claims": "Review claims",
+        "avg_risk_score": "_drop",
+    }).drop(columns=["_drop", "review_rate"], errors="ignore")
+
+    # Visual store cards (one per store)
+    for _, srow in _ss_display.iterrows():
+        _s_score  = float(srow.get("Risk score", 0))
+        _s_grade, _s_label, _s_col = _risk_grade(_s_score)
+        _s_pct    = max(2, int(_s_score))
+        _s_num    = srow.get("Store number", "—")
+        _s_ploc   = srow.get("Pharmacy location", "") or ""
+        _s_total  = int(srow.get("Total claims", 0))
+        _s_review = int(srow.get("Review claims", 0))
+        _s_rrate  = srow.get("Review rate", "—")
+        st.markdown(
+            f"""<div style="border:1px solid #dee2e6;border-radius:10px;
+                padding:16px 20px;margin:8px 0;background:#fff">
+              <div style="display:flex;align-items:center;
+                          justify-content:space-between;flex-wrap:wrap;gap:12px">
+                <div>
+                  <div style="font-size:1.05em;font-weight:700;color:#1a2e4a">
+                    Store {_s_num}</div>
+                  <div style="color:#888;font-size:0.82em">{_s_ploc}</div>
+                </div>
+                <div style="text-align:center">
+                  <div style="font-size:2.2em;font-weight:800;color:{_s_col};line-height:1">
+                    {_s_score:.0f}</div>
+                  <div style="font-size:0.75em;color:#888">/ 100 risk score</div>
+                </div>
+                <div style="background:{_s_col};color:white;padding:4px 14px;
+                            border-radius:20px;font-weight:700;font-size:1em">
+                  Grade {_s_grade} — {_s_label}</div>
+                <div style="display:flex;gap:20px">
+                  <div style="text-align:center">
+                    <div style="font-size:1.3em;font-weight:700;color:#1a2e4a">{_s_total:,}</div>
+                    <div style="font-size:0.75em;color:#888">Total claims</div>
+                  </div>
+                  <div style="text-align:center">
+                    <div style="font-size:1.3em;font-weight:700;color:#e74c3c">{_s_review:,}</div>
+                    <div style="font-size:0.75em;color:#888">Review</div>
+                  </div>
+                  <div style="text-align:center">
+                    <div style="font-size:1.3em;font-weight:700;color:#e67e22">{_s_rrate}</div>
+                    <div style="font-size:0.75em;color:#888">Review rate</div>
+                  </div>
+                </div>
+              </div>
+              <div style="background:#eee;border-radius:6px;height:10px;
+                          overflow:hidden;margin-top:12px">
+                <div style="background:{_s_col};width:{_s_pct}%;height:100%;
+                            border-radius:6px"></div>
+              </div>
+            </div>""",
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("---")
+    st.caption("Full store data table")
+    st.dataframe(_ss_display, width="stretch", height=300)
 
 
 # ── TAB 4: Exception Management ──────────────────────────────────────────────
@@ -683,7 +916,195 @@ with tab_exc:
         )
 
 
-# ── TAB 5: Downloads ──────────────────────────────────────────────────────────
+# ── TAB 5: Provider Registry ──────────────────────────────────────────────────
+
+with tab_prov:
+    st.subheader("Site Provider Registry")
+    st.caption(
+        "Upload your covered entity's eligible prescriber NPIs. "
+        "Once saved, the engine remembers them across sessions and automatically flags "
+        "any claim where the prescriber is not in your registry as Ineligible Prescriber."
+    )
+
+    _reg = _cached_registry()["df"]
+    _reg_count = len(_reg) if _reg is not None else 0
+
+    # ── Status card ───────────────────────────────────────────────────────────
+    if _reg_count > 0:
+        st.markdown(
+            f"<div style='background:#e8f5e9;border:1px solid #a5d6a7;border-radius:8px;"
+            f"padding:14px 20px;margin-bottom:16px'>"
+            f"<span style='font-size:1.5em;font-weight:800;color:#2e7d32'>{_reg_count:,}</span>"
+            f"<span style='color:#388e3c;font-size:0.95em;margin-left:8px'>"
+            f"providers committed to memory — Ineligible Prescriber check is ACTIVE</span>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.warning(
+            "No providers in registry. Upload a file below and click **Commit to registry** "
+            "to enable the Ineligible Prescriber check across all audit runs."
+        )
+
+    st.markdown("---")
+
+    # ── Upload section ────────────────────────────────────────────────────────
+    st.markdown("#### Add providers")
+    st.caption(
+        "Upload a CSV or Excel file containing your site's eligible prescriber NPIs. "
+        "Required column: `NPI` (10-digit). Optional columns: `Provider name`, `Specialty`, `Site`, `Active`."
+    )
+
+    _prov_upload = st.file_uploader(
+        "Provider NPI file (CSV or Excel)",
+        type=["csv", "xlsx", "xls"],
+        key="prov_reg_upload",
+        help="Must contain an 'NPI' column with 10-digit provider NPIs.",
+    )
+
+    if _prov_upload is not None:
+        try:
+            _fname = _prov_upload.name.lower()
+            if _fname.endswith((".xlsx", ".xls")):
+                _new_providers = pd.read_excel(_prov_upload, dtype=str)
+            else:
+                _new_providers = pd.read_csv(_prov_upload, dtype=str)
+
+            # Normalize NPI column name
+            _npi_col = next(
+                (c for c in _new_providers.columns
+                 if c.strip().upper() in ("NPI", "PROVIDER NPI", "PROVIDER_NPI", "DR NPI", "DR NPI")),
+                None,
+            )
+            if _npi_col is None:
+                st.error(
+                    "Could not find an NPI column. "
+                    "Ensure your file has a column named `NPI`, `Provider NPI`, or `DR NPI`."
+                )
+            else:
+                if _npi_col != "NPI":
+                    _new_providers = _new_providers.rename(columns={_npi_col: "NPI"})
+                # Strip non-digits from NPI
+                _new_providers["NPI"] = (
+                    _new_providers["NPI"].astype(str).str.strip().str.replace(r"\D", "", regex=True)
+                )
+                _new_providers = _new_providers[_new_providers["NPI"].str.fullmatch(r"\d{10}")]
+
+                st.success(f"Found {len(_new_providers):,} valid 10-digit NPIs in uploaded file.")
+                st.dataframe(
+                    _new_providers.head(20),
+                    width="stretch",
+                    height=250,
+                )
+                if len(_new_providers) > 20:
+                    st.caption(f"Showing first 20 of {len(_new_providers):,} rows.")
+
+                _col_add, _col_replace = st.columns(2)
+
+                # Merge into existing registry
+                with _col_add:
+                    if st.button(
+                        f"➕ Add to registry ({len(_new_providers):,} providers)",
+                        type="primary",
+                        key="prov_add_btn",
+                    ):
+                        if _reg is not None and not _reg.empty:
+                            _merged = (
+                                pd.concat([_reg, _new_providers], ignore_index=True)
+                                .drop_duplicates(subset=["NPI"])
+                                .reset_index(drop=True)
+                            )
+                        else:
+                            _merged = _new_providers.copy()
+                        _save_registry(_merged)
+                        st.success(
+                            f"Registry updated — {len(_merged):,} providers committed to memory. "
+                            "Re-run the audit to apply."
+                        )
+                        st.rerun()
+
+                # Replace existing registry
+                with _col_replace:
+                    if st.button(
+                        "Replace registry with this file",
+                        key="prov_replace_btn",
+                    ):
+                        _save_registry(_new_providers.copy())
+                        st.success(
+                            f"Registry replaced — {len(_new_providers):,} providers committed to memory. "
+                            "Re-run the audit to apply."
+                        )
+                        st.rerun()
+
+        except Exception as _pe:
+            st.error(f"Could not read provider file: {_pe}")
+
+    # ── Download template ─────────────────────────────────────────────────────
+    _tmpl = pd.DataFrame(columns=["NPI", "Provider name", "Specialty", "Site", "Active"])
+    st.download_button(
+        "⬇ Download provider template CSV",
+        data=_tmpl.to_csv(index=False).encode(),
+        file_name="provider_registry_template.csv",
+        mime="text/csv",
+        key="prov_tmpl_dl",
+    )
+
+    # ── Current registry ──────────────────────────────────────────────────────
+    if _reg_count > 0:
+        st.markdown("---")
+        st.markdown(f"#### Current registry — {_reg_count:,} providers")
+
+        _search = st.text_input(
+            "Search registry (NPI or name)",
+            placeholder="Type NPI or provider name…",
+            key="prov_search",
+        )
+        _reg_display = _reg.copy()
+        if _search.strip():
+            _mask = _reg_display.apply(
+                lambda col: col.astype(str).str.contains(_search.strip(), case=False, na=False)
+            ).any(axis=1)
+            _reg_display = _reg_display[_mask]
+
+        st.dataframe(_reg_display, width="stretch", height=350)
+        st.caption(f"Showing {len(_reg_display):,} of {_reg_count:,} registered providers.")
+
+        # Export registry
+        st.download_button(
+            "⬇ Export registry as CSV",
+            data=_reg.to_csv(index=False).encode(),
+            file_name="provider_registry.csv",
+            mime="text/csv",
+            key="prov_export_dl",
+        )
+
+        st.markdown("---")
+        # Impact on current audit
+        if "claims" in dir():
+            _flagged_ip = int((claims.get("Compliance category", pd.Series()) == INELIGIBLE_PRESCRIBER).sum()) \
+                if "Compliance category" in claims.columns else 0
+            _reg_npis = set(_reg["NPI"].astype(str).str.strip())
+            _claim_npis = set(claims["Provider NPI"].astype(str).str.strip()) \
+                if "Provider NPI" in claims.columns else set()
+            _unmatched = _claim_npis - _reg_npis - {""}
+            st.info(
+                f"**Registry impact on current audit:** "
+                f"{_flagged_ip:,} claims flagged as Ineligible Prescriber · "
+                f"{len(_unmatched):,} unique NPIs in claims not found in registry."
+            )
+
+        # Clear registry
+        with st.expander("Danger zone"):
+            st.warning("This will permanently delete the provider registry from memory.")
+            if st.button("Clear registry", type="secondary", key="prov_clear_btn"):
+                if _PROVIDER_REGISTRY.exists():
+                    _PROVIDER_REGISTRY.unlink()
+                _cached_registry.clear()
+                st.success("Registry cleared.")
+                st.rerun()
+
+
+# ── TAB 6: Downloads ──────────────────────────────────────────────────────────
 
 with tab_dl:
     st.subheader("Downloads")

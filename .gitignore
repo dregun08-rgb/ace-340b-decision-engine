@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 *.pyo
 rules_config.json
+provider_registry.json
 .DS_Store
 *.egg-info/
 dist/
