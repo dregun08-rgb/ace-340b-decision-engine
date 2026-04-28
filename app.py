@@ -437,7 +437,7 @@ st.markdown("---")
 # ═══════════════════════════════════════════════════════════════════════════════
 
 tab_queue, tab_all, tab_store, tab_exc, tab_dl = st.tabs([
-    "🚦 Decision Queue",
+    "⚠️ Review Queue",
     "📄 All Claims",
     "🏪 Store Status",
     "📋 Exception Management",
@@ -445,101 +445,165 @@ tab_queue, tab_all, tab_store, tab_exc, tab_dl = st.tabs([
 ])
 
 
-# ── TAB 1: Decision Queue ─────────────────────────────────────────────────────
+# ── TAB 1: Review Queue (bucketed by deficiency category) ─────────────────────
+
+_BUCKET_ORDER = [c for c in CATEGORY_ORDER if c != COMPLIANT]
+_BUCKET_ICONS = {
+    DUPLICATE_DISCOUNT:    "🚨",
+    INELIGIBLE_PRESCRIBER: "⚕️",
+    WRONG_SITE:            "🏥",
+    MISSING_ENCOUNTER:     "🔍",
+    DATA_MISMATCH:         "📋",
+}
 
 with tab_queue:
-    st.subheader("Decision Queue — prioritised by category severity")
-    st.caption(
-        "Claims are ordered highest-severity first (Duplicate Discount → "
-        "Ineligible Prescriber → Wrong Site → Missing Encounter → Data Mismatch). "
-        "Select a category to filter, then expand a row to view its full corrective action plan."
-    )
+    total_review = len(reviewed_claims)
 
-    # category filter
-    q_cats = st.multiselect(
-        "Filter by category",
-        options=[c for c in CATEGORY_ORDER if c != COMPLIANT],
-        default=[c for c in CATEGORY_ORDER if c != COMPLIANT],
-        key="q_cats",
-    )
-
-    queue_df = (
-        reviewed_claims[reviewed_claims["Compliance category"].isin(q_cats)]
-        if q_cats else reviewed_claims
-    ).copy()
-
-    # truncate action plan for table display
-    QUEUE_COLS = [
-        "Prescription number", "Fill date", "Drug name",
-        "Prescribing provider", "Provider NPI", "Store number",
-        "Compliance category", "Risk score", "Risk tier",
-        "Duplicate reason", "MEF check", "MEF inconsistency", "Missing fields list",
-    ]
-    queue_display = queue_df[[c for c in QUEUE_COLS if c in queue_df.columns]].copy()
-
-    st.caption(f"Showing {len(queue_display):,} claims requiring action")
-    st.dataframe(queue_display, width="stretch", height=340)
-
-    # ── full action plan viewer ────────────────────────────────────────────────
-    st.markdown("---")
-    st.subheader("Full corrective action plan")
-
-    if len(queue_df) == 0:
-        st.success("No claims require action in the selected categories.")
+    if total_review == 0:
+        st.success("✅ All claims passed — nothing in the review queue.")
     else:
-        rx_options = queue_df["Prescription number"].astype(str).unique().tolist()
+        # ── bucket summary bar ─────────────────────────────────────────────────
+        st.markdown(
+            f"<h3 style='margin-bottom:4px'>⚠️ Review Queue"
+            f" <span style='color:#e74c3c;font-size:0.85em'>"
+            f"{total_review:,} claims require evaluation</span></h3>",
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            "Claims are grouped by deficiency category, ordered highest-severity first. "
+            "Select a bucket to drill into its claims, then pick an Rx# to see the full corrective action plan."
+        )
+
+        # Compute per-bucket counts (only buckets that have claims)
+        bucket_counts = {
+            cat: int((reviewed_claims["Compliance category"] == cat).sum())
+            for cat in _BUCKET_ORDER
+        }
+        active_buckets = [c for c in _BUCKET_ORDER if bucket_counts[c] > 0]
+
+        # Bucket summary pills
+        pill_html = "<div style='display:flex;flex-wrap:wrap;gap:10px;margin:12px 0'>"
+        for cat in active_buckets:
+            color = CATEGORY_COLORS.get(cat, "#555")
+            icon  = _BUCKET_ICONS.get(cat, "•")
+            cnt   = bucket_counts[cat]
+            pill_html += (
+                f"<div style='background:{color};color:white;padding:5px 14px;"
+                f"border-radius:20px;font-weight:600;font-size:0.85em'>"
+                f"{icon} {cat}: {cnt:,}</div>"
+            )
+        pill_html += "</div>"
+        st.markdown(pill_html, unsafe_allow_html=True)
+
+        # ── bucket selector ────────────────────────────────────────────────────
+        bucket_labels = [
+            f"{_BUCKET_ICONS.get(c,'•')} {c} ({bucket_counts[c]:,})"
+            for c in active_buckets
+        ]
+        selected_label = st.radio(
+            "Select deficiency bucket to evaluate",
+            options=bucket_labels,
+            horizontal=True,
+            key="bucket_radio",
+        )
+        selected_bucket = active_buckets[bucket_labels.index(selected_label)]
+
+        bucket_df = reviewed_claims[
+            reviewed_claims["Compliance category"] == selected_bucket
+        ].copy()
+
+        # ── bucket table ───────────────────────────────────────────────────────
+        bucket_color = CATEGORY_COLORS.get(selected_bucket, "#555")
+        st.markdown(
+            f"<div style='background:{bucket_color};color:white;padding:6px 16px;"
+            f"border-radius:6px;font-weight:700;font-size:1em;margin:8px 0'>"
+            f"{_BUCKET_ICONS.get(selected_bucket,'')} {selected_bucket} — "
+            f"{len(bucket_df):,} claims</div>",
+            unsafe_allow_html=True,
+        )
+        st.caption(CATEGORY_DESCRIPTIONS.get(selected_bucket, ""))
+
+        BUCKET_COLS = [
+            "Prescription number", "Fill date", "Drug name",
+            "Prescribing provider", "Provider NPI", "Store number",
+            "Risk score", "Risk tier",
+            "Duplicate reason", "NDC check", "NPI check",
+            "Encounter date check", "Missing fields list",
+        ]
+        bucket_display = bucket_df[
+            [c for c in BUCKET_COLS if c in bucket_df.columns]
+        ].copy()
+        st.dataframe(bucket_display, width="stretch", height=300)
+
+        # ── export this bucket ─────────────────────────────────────────────────
+        export_bucket = bucket_df[
+            [c for c in [
+                "Prescription number", "Fill date", "Drug name",
+                "Prescribing provider", "Provider NPI", "Store number",
+                "Compliance category", "Risk score", "Risk tier",
+                "Duplicate reason", "Missing fields list", "Action plan",
+            ] if c in bucket_df.columns]
+        ].copy()
+        st.download_button(
+            f"⬇ Export {selected_bucket} claims ({len(bucket_df):,})",
+            data=export_bucket.to_csv(index=False).encode(),
+            file_name=f"ace_340b_{selected_bucket.lower().replace(' ','_')}.csv",
+            mime="text/csv",
+            key="bucket_export",
+        )
+
+        # ── corrective action plan panel ───────────────────────────────────────
+        st.markdown("---")
+        st.subheader("Corrective action plan")
+        st.caption("Pick an Rx# from this bucket to see the full remediation steps.")
+
+        rx_options = bucket_df["Prescription number"].astype(str).unique().tolist()
         selected_rx = st.selectbox(
-            "Select Rx# to view corrective action plan",
+            "Rx# to evaluate",
             options=["— select —"] + rx_options,
             key="selected_rx",
         )
 
         if selected_rx and selected_rx != "— select —":
-            row = queue_df[queue_df["Prescription number"].astype(str) == selected_rx].iloc[0]
-            cat = str(row.get("Compliance category", ""))
-            color = CATEGORY_COLORS.get(cat, "#555")
+            row = bucket_df[
+                bucket_df["Prescription number"].astype(str) == selected_rx
+            ].iloc[0]
 
             c1, c2, c3 = st.columns(3)
-            c1.markdown(f"**Rx#:** {row.get('Prescription number', 'N/A')}")
-            c2.markdown(f"**Patient:** {row.get('Patient name', 'N/A')}")
-            c3.markdown(f"**Fill date:** {str(row.get('Fill date', 'N/A'))[:10]}")
+            c1.markdown(f"**Rx#:** `{row.get('Prescription number','N/A')}`")
+            c2.markdown(f"**Patient:** {row.get('Patient name','N/A')}")
+            c3.markdown(f"**Fill date:** {str(row.get('Fill date','N/A'))[:10]}")
             c4, c5, c6 = st.columns(3)
-            c4.markdown(f"**Drug:** {row.get('Drug name', 'N/A')}")
-            c5.markdown(f"**Prescriber:** {row.get('Prescribing provider', 'N/A')}")
-            c6.markdown(f"**Store:** {row.get('Store number', 'N/A')}")
+            c4.markdown(f"**Drug:** {row.get('Drug name','N/A')}")
+            c5.markdown(f"**Prescriber:** {row.get('Prescribing provider','N/A')}")
+            c6.markdown(f"**Store:** {row.get('Store number','N/A')}")
 
-            st.markdown(
-                f"<div style='background:{color};color:white;padding:6px 14px;"
-                f"border-radius:6px;display:inline-block;font-weight:700;"
-                f"margin:8px 0'>{cat}</div>",
-                unsafe_allow_html=True,
-            )
-            st.caption(CATEGORY_DESCRIPTIONS.get(cat, ""))
+            sc1, sc2, sc3 = st.columns(3)
+            sc1.metric("Risk score", int(row.get("Risk score", 0)))
+            sc2.metric("Risk tier",  str(row.get("Risk tier", "N/A")))
+            sc3.metric("NPI",        str(row.get("NPI check", "N/A")))
 
-            score_col, tier_col = st.columns(2)
-            score_col.metric("Risk score", int(row.get("Risk score", 0)))
-            tier_col.metric("Risk tier",   str(row.get("Risk tier", "N/A")))
-
-            st.markdown("---")
+            st.markdown("**Action plan**")
             plan = str(row.get("Action plan", "No action plan available."))
             st.code(plan, language=None)
 
-        # ── bulk export with plans ─────────────────────────────────────────────
-        if len(queue_df) > 0:
-            export_df = queue_df[
-                [c for c in [
-                    "Prescription number", "Fill date", "Drug name",
-                    "Prescribing provider", "Provider NPI", "Store number",
-                    "Compliance category", "Risk score", "Risk tier",
-                    "Duplicate reason", "Missing fields list", "Action plan",
-                ] if c in queue_df.columns]
-            ].copy()
-            st.download_button(
-                "⬇ Export decision queue with action plans",
-                data=export_df.to_csv(index=False).encode(),
-                file_name="ace_340b_decision_queue.csv",
-                mime="text/csv",
-            )
+        # ── full queue export ──────────────────────────────────────────────────
+        st.markdown("---")
+        full_export = reviewed_claims[
+            [c for c in [
+                "Prescription number", "Fill date", "Drug name",
+                "Prescribing provider", "Provider NPI", "Store number",
+                "Compliance category", "Risk score", "Risk tier",
+                "Duplicate reason", "Missing fields list", "Action plan",
+            ] if c in reviewed_claims.columns]
+        ].copy()
+        st.download_button(
+            f"⬇ Export full review queue — all categories ({total_review:,} claims)",
+            data=full_export.to_csv(index=False).encode(),
+            file_name="ace_340b_full_review_queue.csv",
+            mime="text/csv",
+            key="full_queue_export",
+        )
 
 
 # ── TAB 2: All Claims ─────────────────────────────────────────────────────────
