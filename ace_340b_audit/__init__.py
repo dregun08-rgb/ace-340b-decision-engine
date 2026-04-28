@@ -1,4 +1,5 @@
 from .engine import run_audit_from_workbook, audit_dataframe
+from .ingest import detect_rx_log, map_rx_log
 from .rules import load_rules, save_rules, DEFAULT_RULES
 from .decisions import (
     categorize_claim,

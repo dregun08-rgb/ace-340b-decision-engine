@@ -13,7 +13,8 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from ace_340b_audit.engine import run_audit_from_workbook
+from ace_340b_audit.engine import run_audit_from_workbook, audit_dataframe
+from ace_340b_audit.ingest import detect_rx_log, map_rx_log
 from ace_340b_audit.rules import DEFAULT_RULES, load_rules, save_rules
 from ace_340b_audit.decisions import (
     CATEGORIES, CATEGORY_COLORS, CATEGORY_DESCRIPTIONS, SEVERITY,
@@ -69,9 +70,13 @@ CATEGORY_ORDER = [DUPLICATE_DISCOUNT, INELIGIBLE_PRESCRIBER, WRONG_SITE,
 
 st.sidebar.header("Data inputs")
 uploaded_file = st.sidebar.file_uploader(
-    "340B workbook (.xlsx) ✳ Required",
-    type=["xlsx"],
-    help="Excel workbook with sheets: Raw_Data, Store_Map, Site_Entity_Map.",
+    "340B workbook (.xlsx) or RX log (.csv) ✳ Required",
+    type=["xlsx", "csv"],
+    help=(
+        "• Excel workbook (.xlsx) with sheets: Raw_Data, Store_Map, Site_Entity_Map\n"
+        "• OR a pharmacy RX-log CSV (columns: RXNBR, FILLDATE, DRUG NAME, NDC, "
+        "RX STOREID, DR NPI). The engine will auto-map and run the audit."
+    ),
 )
 st.sidebar.caption("All files below are optional — the audit runs without them.")
 provider_master_file = st.sidebar.file_uploader(
@@ -208,22 +213,35 @@ def _write_temp(data: bytes, suffix: str) -> str:
 
 
 source_path: str | None = None
+input_format: str = "excel"   # "excel" | "csv"
 if uploaded_file is not None:
     # Persist temp file path for the lifetime of this upload so re-runs don't
     # create a new path (which would bust @st.cache_data on _load_results).
     file_id = uploaded_file.file_id
     if st.session_state.get("_wb_file_id") != file_id:
         wb_bytes = uploaded_file.getbuffer().tobytes()
-        # Reject non-Excel uploads with a clear message
-        if not wb_bytes[:4] in (b"PK\x03\x04", b"\xd0\xcf\x11\xe0"):
+        fname    = uploaded_file.name.lower()
+        if fname.endswith(".csv"):
+            suffix = ".csv"
+        elif wb_bytes[:4] in (b"PK\x03\x04", b"\xd0\xcf\x11\xe0"):
+            suffix = ".xlsx"
+        else:
             st.error(
-                "⚠️  The uploaded file does not appear to be an Excel workbook (.xlsx / .xls). "
-                "Please upload the 340B claims workbook in Excel format."
+                "⚠️  Unrecognised file format. Upload a .xlsx workbook or a pharmacy RX-log .csv file."
             )
             st.stop()
-        st.session_state["_wb_file_id"] = file_id
-        st.session_state["_wb_path"]    = _write_temp(wb_bytes, ".xlsx")
-    source_path = st.session_state["_wb_path"]
+        st.session_state["_wb_file_id"]  = file_id
+        st.session_state["_wb_path"]     = _write_temp(wb_bytes, suffix)
+        st.session_state["_wb_format"]   = "csv" if suffix == ".csv" else "excel"
+    source_path  = st.session_state["_wb_path"]
+    input_format = st.session_state.get("_wb_format", "excel")
+    if input_format == "csv":
+        st.sidebar.info(
+            "RX-log CSV detected. Columns auto-mapped to the 340B audit engine. "
+            "Store/entity mapping checks will show REVIEW until 340B registration "
+            "data is available — all other checks (NPI, NDC, encounter date, "
+            "duplicate discount) run on live claim data."
+        )
 elif DEFAULT_SAMPLE.exists():
     source_path = str(DEFAULT_SAMPLE)
     st.sidebar.success("Loaded bundled MAP sample workbook")
@@ -260,13 +278,33 @@ if exceptions_file is not None:
 # ── run audit ─────────────────────────────────────────────────────────────────
 
 @st.cache_data(show_spinner=False)
-def _load_results(path, pm_json, mef_json, exc_json, rules_json, carve) -> dict:
+def _load_results(path, pm_json, mef_json, exc_json, rules_json, carve, fmt="excel") -> dict:
     rules = json.loads(rules_json)
     pm    = pd.read_json(pm_json)  if pm_json  else None
     mef   = pd.read_json(mef_json) if mef_json else None
     exc   = pd.read_json(exc_json) if exc_json else None
-    res   = run_audit_from_workbook(path, rules=rules, exceptions=exc,
-                                    provider_master=pm, mef=mef, carve_status=carve)
+
+    if fmt == "csv":
+        raw_df = pd.read_csv(path, dtype=str, low_memory=False)
+        if not detect_rx_log(raw_df):
+            raise ValueError(
+                "CSV does not match the expected RX-log format. "
+                "Required columns: RXNBR, FILLDATE, DRUG NAME, NDC, RX STOREID, DR NPI."
+            )
+        raw_df, store_map_df, site_entity_df = map_rx_log(raw_df)
+        res = audit_dataframe(
+            raw=raw_df,
+            store_map=store_map_df,
+            site_entity_map=site_entity_df,
+            provider_master=pm,
+            mef=mef,
+            exceptions=exc,
+            rules=rules,
+            carve_status=carve,
+        )
+    else:
+        res = run_audit_from_workbook(path, rules=rules, exceptions=exc,
+                                      provider_master=pm, mef=mef, carve_status=carve)
     return {k: v.to_dict(orient="split") for k, v in res.items()}
 
 
@@ -281,13 +319,19 @@ exc_json   = exceptions_df.to_json()      if exceptions_df       is not None els
 
 with st.spinner("Running decision engine…"):
     try:
-        cached = _load_results(source_path, pm_json, mef_json, exc_json, rules_json, carve_status)
+        cached = _load_results(source_path, pm_json, mef_json, exc_json, rules_json, carve_status, input_format)
     except ValueError as _ve:
         _msg = str(_ve)
         if "not found" in _msg.lower() or "worksheet" in _msg.lower():
             st.error(
                 "⚠️  **Workbook sheet not found.** Your Excel file must contain sheets named exactly: "
                 "`Raw_Data`, `Store_Map`, `Site_Entity_Map`. "
+                f"Detail: {_msg}"
+            )
+        elif "rx-log format" in _msg.lower() or "required columns" in _msg.lower():
+            st.error(
+                "⚠️  **CSV format not recognised.** The uploaded CSV does not match the RX-log format. "
+                "Required columns: `RXNBR`, `FILLDATE`, `DRUG NAME`, `NDC`, `RX STOREID`, `DR NPI`. "
                 f"Detail: {_msg}"
             )
         else:
