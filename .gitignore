@@ -4,6 +4,7 @@ __pycache__/
 *.pyo
 rules_config.json
 provider_registry.json
+site_registry.json
 .DS_Store
 *.egg-info/
 dist/

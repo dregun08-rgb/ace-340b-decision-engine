@@ -63,13 +63,14 @@ def map_rx_log(
     raw : pd.DataFrame
         Claim-level data with engine-canonical column names.
     store_map : pd.DataFrame
-        One row per unique store; ``Store number`` column only.
-        Other mapping fields (Pharmacy location, 340B ID, …) are left blank
-        so the engine's store-mapping check flags them for REVIEW.
+        One row per unique store; ``Pharmacy location`` is populated with the
+        physical site address from DOCADD1/DOCCITY/DOCST/DOCZIP.
+        ``340B ID`` / ``Covered entity`` are left blank until registered via
+        the Site Registry tab, at which point the engine's entity check passes.
     site_entity_map : pd.DataFrame
         Minimal map with ``Site location`` = store number so the entity join
         can run; ``340B ID`` / ``Covered entity`` are left blank, which causes
-        ``Entity map`` = REVIEW until the user populates those fields.
+        ``Entity map`` = REVIEW until the user registers the site.
     """
     raw = df.rename(columns={k: v for k, v in _COLUMN_MAP.items() if k in df.columns})
 
@@ -85,6 +86,44 @@ def map_rx_log(
         plast  = df.get("PATNAMELAST",  pd.Series([""] * len(df), dtype=str)).fillna("").astype(str).str.strip()
         raw["Patient name"] = (pfirst + " " + plast).str.strip()
 
+    # ── Per-store address from prescriber location columns ────────────────────
+    # DOCADD1/DOCADD2/DOCCITY/DOCST/DOCZIP give the physical site address.
+    # Build a {store_id: "address"} lookup so each store card shows the real
+    # address instead of the raw store number.
+    def _s(col: str) -> pd.Series:
+        return (
+            df.get(col, pd.Series([""] * len(df), dtype=str))
+            .fillna("").astype(str).str.strip()
+        )
+
+    _addr_df = pd.DataFrame({
+        "store": (
+            df["RX STOREID"].astype(str).str.strip()
+            if "RX STOREID" in df.columns
+            else raw["Store number"].astype(str).str.strip()
+        ),
+        "add1": _s("DOCADD1"),
+        "add2": _s("DOCADD2"),
+        "city": _s("DOCCITY"),
+        "st":   _s("DOCST"),
+        "zip":  _s("DOCZIP"),
+    })
+
+    _store_addr: dict[str, str] = {}
+    for sid, grp in _addr_df.groupby("store"):
+        r = grp.iloc[0]
+        parts: list[str] = [r["add1"]] if r["add1"] else []
+        if r["add2"]:
+            parts.append(r["add2"])
+        state_zip = " ".join(p for p in [r["st"], r["zip"]] if p)
+        if r["city"] and state_zip:
+            parts.append(f"{r['city']}, {state_zip}")
+        elif r["city"]:
+            parts.append(r["city"])
+        elif state_zip:
+            parts.append(state_zip)
+        _store_addr[str(sid)] = ", ".join(parts) if parts else str(sid)
+
     # ── Store_Map: one row per unique store ───────────────────────────────────
     stores = (
         raw["Store number"]
@@ -98,15 +137,20 @@ def map_rx_log(
     )
     store_map = pd.DataFrame({
         "Store number":           stores,
-        # Pre-populate location fields from the store ID so they appear in
-        # audit output; 340B ID / Covered entity left blank until configured.
-        "Pharmacy location":      stores,
+        # Pharmacy location shows the real site address for display.
+        # Site location / Patient encounter site stay as store IDs so the
+        # entity-join key remains stable until 340B IDs are registered.
+        "Pharmacy location":      [_store_addr.get(s, s) for s in stores],
         "Site location":          stores,
         "Patient encounter site": stores,
+        # Entity site address also set from physical address so the
+        # Store-map completeness check can pass once 340B ID + Covered entity
+        # are registered via the Site Registry tab.
+        "Entity site address":    [_store_addr.get(s, s) for s in stores],
     })
 
     # ── Site_Entity_Map: minimal — entity match will be REVIEW until user
-    #    populates 340B ID / Covered entity via the store map upload ──────────
+    #    populates 340B ID / Covered entity via the Site Registry tab ──────────
     site_entity_map = pd.DataFrame({
         "Site location":                stores,
         "Valid patient encounter site": stores,

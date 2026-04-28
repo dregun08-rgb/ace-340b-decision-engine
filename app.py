@@ -67,6 +67,7 @@ CATEGORY_ORDER = [DUPLICATE_DISCOUNT, INELIGIBLE_PRESCRIBER, WRONG_SITE,
 
 # ── provider registry (persisted to disk) ─────────────────────────────────────
 _PROVIDER_REGISTRY = Path(__file__).resolve().parent / "provider_registry.json"
+_SITE_REGISTRY     = Path(__file__).resolve().parent / "site_registry.json"
 
 def _load_registry() -> pd.DataFrame | None:
     """Load saved provider registry from disk; returns None if not present."""
@@ -88,6 +89,32 @@ def _save_registry(df: pd.DataFrame) -> None:
 def _cached_registry():
     """Cache the registry across reruns so it isn't re-read every script run."""
     return {"df": _load_registry()}
+
+
+# ── site registry (persisted to disk) ─────────────────────────────────────────
+# Maps {store_id: {"340B ID": "...", "Covered entity": "..."}}
+# Once a store is registered the engine entity check passes for that site.
+
+def _load_site_registry() -> dict:
+    """Load site registry from disk; returns {} if not present or unreadable."""
+    if _SITE_REGISTRY.exists():
+        try:
+            with open(_SITE_REGISTRY) as _f:
+                return json.load(_f)
+        except Exception:
+            pass
+    return {}
+
+def _save_site_registry(reg: dict) -> None:
+    """Persist site registry to disk and clear the cached resource."""
+    with open(_SITE_REGISTRY, "w") as _f:
+        json.dump(reg, _f, indent=2)
+    _cached_site_registry.clear()
+
+@st.cache_resource
+def _cached_site_registry():
+    """Cache site registry across reruns."""
+    return {"data": _load_site_registry()}
 
 
 # ── sidebar ───────────────────────────────────────────────────────────────────
@@ -275,12 +302,21 @@ if uploaded_file is not None:
     source_path  = st.session_state["_wb_path"]
     input_format = st.session_state.get("_wb_format", "excel")
     if input_format == "csv":
-        st.sidebar.info(
-            "RX-log CSV detected. Columns auto-mapped to the 340B audit engine. "
-            "Store/entity mapping checks will show REVIEW until 340B registration "
-            "data is available — all other checks (NPI, NDC, encounter date, "
-            "duplicate discount) run on live claim data."
-        )
+        _reg_count_sites = len(_cached_site_registry()["data"])
+        if _reg_count_sites > 0:
+            st.sidebar.success(
+                f"RX-log CSV detected. {_reg_count_sites} site(s) registered — "
+                "entity/site checks active. Go to Store Status → 340B Site Registration "
+                "to add or update sites."
+            )
+        else:
+            st.sidebar.info(
+                "RX-log CSV detected. Columns auto-mapped to the 340B audit engine. "
+                "Go to **Store Status → 340B Site Registration** to register your "
+                "340B ID and covered entity — this activates the entity/site-of-care check. "
+                "All other checks (NPI, NDC, encounter date, duplicate discount) "
+                "run on live claim data."
+            )
 elif DEFAULT_SAMPLE.exists():
     source_path = str(DEFAULT_SAMPLE)
     st.sidebar.success("Loaded bundled MAP sample workbook")
@@ -332,7 +368,8 @@ if exceptions_file is not None:
 # ── run audit ─────────────────────────────────────────────────────────────────
 
 @st.cache_data(show_spinner=False)
-def _load_results(path, pm_json, mef_json, exc_json, rules_json, carve, fmt="excel") -> dict:
+def _load_results(path, pm_json, mef_json, exc_json, rules_json, carve,
+                  fmt="excel", site_reg_json=None) -> dict:
     rules = json.loads(rules_json)
 
     def _rj(j):
@@ -355,6 +392,28 @@ def _load_results(path, pm_json, mef_json, exc_json, rules_json, carve, fmt="exc
                 "Required columns: RXNBR, FILLDATE, DRUG NAME, NDC, RX STOREID, DR NPI."
             )
         raw_df, store_map_df, site_entity_df = map_rx_log(raw_df)
+
+        # ── Apply site registry ───────────────────────────────────────────────
+        # Populate 340B ID + Covered entity in both store_map and site_entity_map
+        # for every registered store so the engine's entity check passes.
+        if site_reg_json:
+            site_reg = json.loads(site_reg_json)
+            for _sid, _reg in site_reg.items():
+                _b340   = str(_reg.get("340B ID", "")).strip()
+                _entity = str(_reg.get("Covered entity", "")).strip()
+                if not _b340:
+                    continue
+                # Update store_map
+                _sm_mask = store_map_df["Store number"].astype(str).str.strip() == str(_sid).strip()
+                if _sm_mask.any():
+                    store_map_df.loc[_sm_mask, "340B ID"]       = _b340
+                    store_map_df.loc[_sm_mask, "Covered entity"] = _entity
+                # Update site_entity_map
+                _se_mask = site_entity_df["Site location"].astype(str).str.strip() == str(_sid).strip()
+                if _se_mask.any():
+                    site_entity_df.loc[_se_mask, "340B ID"]       = _b340
+                    site_entity_df.loc[_se_mask, "Covered entity"] = _entity
+
         res = audit_dataframe(
             raw=raw_df,
             store_map=store_map_df,
@@ -375,14 +434,17 @@ def _reconstruct(cached: dict) -> dict[str, pd.DataFrame]:
     return {k: pd.DataFrame(**v) for k, v in cached.items()}
 
 
-rules_json = json.dumps(load_rules())
-pm_json    = provider_master_df.to_json() if provider_master_df is not None else None
-mef_json   = mef_df.to_json()             if mef_df             is not None else None
-exc_json   = exceptions_df.to_json()      if exceptions_df       is not None else None
+rules_json    = json.dumps(load_rules())
+pm_json       = provider_master_df.to_json() if provider_master_df is not None else None
+mef_json      = mef_df.to_json()             if mef_df             is not None else None
+exc_json      = exceptions_df.to_json()      if exceptions_df       is not None else None
+_site_reg_raw = _cached_site_registry()["data"]
+site_reg_json = json.dumps(_site_reg_raw) if _site_reg_raw else None
 
 with st.spinner("Running decision engine…"):
     try:
-        cached = _load_results(source_path, pm_json, mef_json, exc_json, rules_json, carve_status, input_format)
+        cached = _load_results(source_path, pm_json, mef_json, exc_json, rules_json,
+                               carve_status, input_format, site_reg_json)
     except ValueError as _ve:
         _msg = str(_ve)
         if "not found" in _msg.lower() or "worksheet" in _msg.lower():
@@ -890,6 +952,107 @@ with tab_store:
     st.markdown("---")
     st.caption("Full store data table")
     st.dataframe(_ss_display, width="stretch", height=300)
+
+    # ── 340B Site Registration ────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("### 🏥 340B Site Registration")
+    st.caption(
+        "Register each site's 340B ID and covered entity name. "
+        "Once registered, claims dispensed from that site will pass the "
+        "entity/site-of-care check. Changes take effect on the next audit run."
+    )
+
+    _site_reg = _cached_site_registry()["data"]
+
+    # Build a list of (store_id, address) from current audit results
+    _reg_stores = (
+        store_status[["Store number", "Pharmacy location"]]
+        .drop_duplicates("Store number")
+        .values.tolist()
+    )
+
+    if not _reg_stores:
+        st.info("Upload a CSV file to detect stores and register sites.")
+    else:
+        _any_registered = any(str(s) in _site_reg for s, _ in _reg_stores)
+        if _any_registered:
+            st.success(
+                f"✅ {sum(1 for s, _ in _reg_stores if str(s) in _site_reg)} of "
+                f"{len(_reg_stores)} site(s) registered — entity check active."
+            )
+
+        for _store_num, _store_addr_val in _reg_stores:
+            _sid = str(_store_num)
+            _existing = _site_reg.get(_sid, {})
+            _is_registered = bool(_existing.get("340B ID", "").strip())
+
+            _badge = (
+                "<span style='background:#27ae60;color:white;border-radius:12px;"
+                "padding:2px 10px;font-size:0.75em;margin-left:8px'>✓ Registered</span>"
+                if _is_registered else
+                "<span style='background:#e67e22;color:white;border-radius:12px;"
+                "padding:2px 10px;font-size:0.75em;margin-left:8px'>Unregistered</span>"
+            )
+            with st.expander(
+                f"Store {_sid} — {_store_addr_val}",
+                expanded=not _is_registered,
+            ):
+                st.markdown(
+                    f"**{_store_addr_val}** {_badge}",
+                    unsafe_allow_html=True,
+                )
+                if _is_registered:
+                    st.markdown(
+                        f"340B ID: `{_existing.get('340B ID','')}` &nbsp;·&nbsp; "
+                        f"Covered entity: **{_existing.get('Covered entity','')}**",
+                        unsafe_allow_html=True,
+                    )
+
+                with st.form(key=f"site_reg_form_{_sid}"):
+                    _c1, _c2 = st.columns(2)
+                    _b340_val = _c1.text_input(
+                        "340B ID",
+                        value=_existing.get("340B ID", ""),
+                        placeholder="e.g. SMC340B-001",
+                        key=f"b340_{_sid}",
+                    )
+                    _ent_val = _c2.text_input(
+                        "Covered entity name",
+                        value=_existing.get("Covered entity", ""),
+                        placeholder="e.g. Southside Medical Center",
+                        key=f"ent_{_sid}",
+                    )
+                    _save_col, _clear_col = st.columns([3, 1])
+                    _submitted = _save_col.form_submit_button(
+                        "💾 Register site",
+                        type="primary",
+                        use_container_width=True,
+                    )
+                    _clear_btn = _clear_col.form_submit_button(
+                        "Remove",
+                        use_container_width=True,
+                    )
+
+                    if _submitted:
+                        if not _b340_val.strip():
+                            st.error("340B ID is required to register a site.")
+                        else:
+                            _site_reg[_sid] = {
+                                "340B ID":       _b340_val.strip(),
+                                "Covered entity": _ent_val.strip(),
+                            }
+                            _save_site_registry(_site_reg)
+                            st.success(
+                                f"Store {_sid} registered as **{_ent_val.strip()}** "
+                                f"(340B ID: {_b340_val.strip()}). Re-running audit…"
+                            )
+                            st.rerun()
+
+                    if _clear_btn and _is_registered:
+                        _site_reg.pop(_sid, None)
+                        _save_site_registry(_site_reg)
+                        st.info(f"Registration for store {_sid} removed.")
+                        st.rerun()
 
 
 # ── TAB 4: Exception Management ──────────────────────────────────────────────
