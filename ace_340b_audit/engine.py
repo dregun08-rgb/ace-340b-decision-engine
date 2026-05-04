@@ -342,7 +342,22 @@ def audit_dataframe(
     medicaid_indicators: list[str] = rules.get("medicaid_indicators", DEFAULT_RULES["medicaid_indicators"])
     mtf_indicators:      list[str] = rules.get("mtf_indicators",      DEFAULT_RULES["mtf_indicators"])
 
-    df = raw.copy()
+    # Streamlit Cloud enables PyArrow-backed dtypes by default.
+    # bool[pyarrow] + int64 raises 'radd not supported', so we convert every
+    # input DataFrame to plain numpy object dtype right here — this covers
+    # ALL ingestion paths (Excel workbook, Excel RX-log, CSV RX-log).
+    def _to_obj(df: pd.DataFrame) -> pd.DataFrame:
+        return df.astype({c: object for c in df.columns})
+
+    df           = _to_obj(raw.copy())
+    store_map    = _to_obj(store_map.copy())
+    site_entity_map = _to_obj(site_entity_map.copy())
+    if provider_master is not None:
+        provider_master = _to_obj(provider_master.copy())
+    if mef is not None:
+        mef = _to_obj(mef.copy())
+    if exceptions is not None:
+        exceptions = _to_obj(exceptions.copy())
     for col in REQUIRED_RAW_COLUMNS:
         if col not in df.columns:
             df[col] = ""
