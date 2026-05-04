@@ -125,8 +125,11 @@ uploaded_file = st.sidebar.file_uploader(
     type=["xlsx", "csv"],
     help=(
         "• Excel workbook (.xlsx) with sheets: Raw_Data, Store_Map, Site_Entity_Map\n"
-        "• OR a pharmacy RX-log CSV (columns: RXNBR, FILLDATE, DRUG NAME, NDC, "
-        "RX STOREID, DR NPI). The engine will auto-map and run the audit."
+        "• Excel RX-log export (.xlsx) — auto-detected when first sheet contains "
+        "RXNBR, FILLDATE, DRUG NAME, NDC, RX STOREID, DR NPI columns\n"
+        "• CSV RX-log (.csv) with the same columns\n"
+        "The engine auto-maps RX-log columns and extracts site addresses from "
+        "DOCADD1/DOCCITY/DOCST/DOCZIP."
     ),
 )
 st.sidebar.caption("All files below are optional — the audit runs without them.")
@@ -278,7 +281,7 @@ def _write_temp(data: bytes, suffix: str) -> str:
 
 
 source_path: str | None = None
-input_format: str = "excel"   # "excel" | "csv"
+input_format: str = "excel"   # "excel" | "csv" | "excel_rxlog"
 if uploaded_file is not None:
     # Persist temp file path for the lifetime of this upload so re-runs don't
     # create a new path (which would bust @st.cache_data on _load_results).
@@ -289,8 +292,20 @@ if uploaded_file is not None:
         fname    = uploaded_file.name.lower()
         if fname.endswith(".csv"):
             suffix = ".csv"
+            _fmt   = "csv"
         elif wb_bytes[:4] in (b"PK\x03\x04", b"\xd0\xcf\x11\xe0"):
             suffix = ".xlsx"
+            # Peek at first sheet to detect RX-log Excel (e.g. rxlog_20260501... sheet)
+            try:
+                import io as _io
+                _px = pd.ExcelFile(_io.BytesIO(wb_bytes))
+                if "Raw_Data" not in _px.sheet_names and _px.sheet_names:
+                    _pdf = _px.parse(_px.sheet_names[0], nrows=3, dtype=str)
+                    _fmt = "excel_rxlog" if detect_rx_log(_pdf) else "excel"
+                else:
+                    _fmt = "excel"
+            except Exception:
+                _fmt = "excel"
         else:
             st.error(
                 "⚠️  Unrecognised file format. Upload a .xlsx workbook or a pharmacy RX-log .csv file."
@@ -298,20 +313,21 @@ if uploaded_file is not None:
             st.stop()
         st.session_state["_wb_file_id"]  = file_id
         st.session_state["_wb_path"]     = _write_temp(wb_bytes, suffix)
-        st.session_state["_wb_format"]   = "csv" if suffix == ".csv" else "excel"
+        st.session_state["_wb_format"]   = _fmt
     source_path  = st.session_state["_wb_path"]
     input_format = st.session_state.get("_wb_format", "excel")
-    if input_format == "csv":
+    if input_format in ("csv", "excel_rxlog"):
+        _fmt_label       = "RX-log CSV" if input_format == "csv" else "RX-log Excel"
         _reg_count_sites = len(_cached_site_registry()["data"])
         if _reg_count_sites > 0:
             st.sidebar.success(
-                f"RX-log CSV detected. {_reg_count_sites} site(s) registered — "
+                f"{_fmt_label} detected. {_reg_count_sites} site(s) registered — "
                 "entity/site checks active. Go to Store Status → 340B Site Registration "
                 "to add or update sites."
             )
         else:
             st.sidebar.info(
-                "RX-log CSV detected. Columns auto-mapped to the 340B audit engine. "
+                f"{_fmt_label} detected. Columns auto-mapped to the 340B audit engine. "
                 "Go to **Store Status → 340B Site Registration** to register your "
                 "340B ID and covered entity — this activates the entity/site-of-care check. "
                 "All other checks (NPI, NDC, encounter date, duplicate discount) "
@@ -376,57 +392,70 @@ def _load_results(path, pm_json, mef_json, exc_json, rules_json, carve,
         df = pd.read_json(j)
         return df.astype({c: object for c in df.columns})
 
-    pm    = _rj(pm_json)  if pm_json  else None
-    mef   = _rj(mef_json) if mef_json else None
-    exc   = _rj(exc_json) if exc_json else None
+    pm  = _rj(pm_json)  if pm_json  else None
+    mef = _rj(mef_json) if mef_json else None
+    exc = _rj(exc_json) if exc_json else None
 
+    # ── helpers shared by CSV and Excel-RX-log paths ──────────────────────────
+    def _apply_site_reg(sm_df, se_df):
+        """Inject registered 340B ID + Covered entity into store_map / site_entity_map."""
+        if not site_reg_json:
+            return sm_df, se_df
+        for _sid, _reg in json.loads(site_reg_json).items():
+            _b340   = str(_reg.get("340B ID", "")).strip()
+            _entity = str(_reg.get("Covered entity", "")).strip()
+            if not _b340:
+                continue
+            _sm = sm_df["Store number"].astype(str).str.strip() == str(_sid).strip()
+            if _sm.any():
+                sm_df.loc[_sm, "340B ID"]        = _b340
+                sm_df.loc[_sm, "Covered entity"] = _entity
+            _se = se_df["Site location"].astype(str).str.strip() == str(_sid).strip()
+            if _se.any():
+                se_df.loc[_se, "340B ID"]        = _b340
+                se_df.loc[_se, "Covered entity"] = _entity
+        return sm_df, se_df
+
+    def _audit_rxlog(raw_df):
+        """Map RX-log columns → canonical, apply site registry, run engine."""
+        raw_df, sm_df, se_df = map_rx_log(raw_df)
+        sm_df, se_df = _apply_site_reg(sm_df, se_df)
+        return audit_dataframe(
+            raw=raw_df, store_map=sm_df, site_entity_map=se_df,
+            provider_master=pm, mef=mef, exceptions=exc,
+            rules=rules, carve_status=carve,
+        )
+
+    def _to_object(df):
+        """Convert all columns to plain object dtype (avoids PyArrow issues on Cloud)."""
+        return df.astype({c: object for c in df.columns})
+
+    # ── route by format ────────────────────────────────────────────────────────
     if fmt == "csv":
-        raw_df = pd.read_csv(path, dtype=str, low_memory=False)
-        # Streamlit Cloud uses PyArrow-backed dtypes by default; arithmetic on
-        # bool[pyarrow] + int64 raises 'radd not supported'. Convert every
-        # column to plain numpy object dtype before entering the engine.
-        raw_df = raw_df.astype({c: object for c in raw_df.columns})
+        raw_df = _to_object(pd.read_csv(path, dtype=str, low_memory=False))
         if not detect_rx_log(raw_df):
             raise ValueError(
                 "CSV does not match the expected RX-log format. "
                 "Required columns: RXNBR, FILLDATE, DRUG NAME, NDC, RX STOREID, DR NPI."
             )
-        raw_df, store_map_df, site_entity_df = map_rx_log(raw_df)
+        res = _audit_rxlog(raw_df)
 
-        # ── Apply site registry ───────────────────────────────────────────────
-        # Populate 340B ID + Covered entity in both store_map and site_entity_map
-        # for every registered store so the engine's entity check passes.
-        if site_reg_json:
-            site_reg = json.loads(site_reg_json)
-            for _sid, _reg in site_reg.items():
-                _b340   = str(_reg.get("340B ID", "")).strip()
-                _entity = str(_reg.get("Covered entity", "")).strip()
-                if not _b340:
-                    continue
-                # Update store_map
-                _sm_mask = store_map_df["Store number"].astype(str).str.strip() == str(_sid).strip()
-                if _sm_mask.any():
-                    store_map_df.loc[_sm_mask, "340B ID"]       = _b340
-                    store_map_df.loc[_sm_mask, "Covered entity"] = _entity
-                # Update site_entity_map
-                _se_mask = site_entity_df["Site location"].astype(str).str.strip() == str(_sid).strip()
-                if _se_mask.any():
-                    site_entity_df.loc[_se_mask, "340B ID"]       = _b340
-                    site_entity_df.loc[_se_mask, "Covered entity"] = _entity
+    elif fmt == "excel_rxlog":
+        # Excel file whose first sheet is an RX-log (e.g. rxlog_20260501092518)
+        import io as _io
+        _xl  = pd.ExcelFile(path)
+        raw_df = _to_object(_xl.parse(_xl.sheet_names[0], dtype=str))
+        if not detect_rx_log(raw_df):
+            raise ValueError(
+                f"Excel sheet '{_xl.sheet_names[0]}' does not match the RX-log format. "
+                "Required columns: RXNBR, FILLDATE, DRUG NAME, NDC, RX STOREID, DR NPI."
+            )
+        res = _audit_rxlog(raw_df)
 
-        res = audit_dataframe(
-            raw=raw_df,
-            store_map=store_map_df,
-            site_entity_map=site_entity_df,
-            provider_master=pm,
-            mef=mef,
-            exceptions=exc,
-            rules=rules,
-            carve_status=carve,
-        )
-    else:
+    else:  # standard 340B workbook
         res = run_audit_from_workbook(path, rules=rules, exceptions=exc,
                                       provider_master=pm, mef=mef, carve_status=carve)
+
     return {k: v.to_dict(orient="split") for k, v in res.items()}
 
 
