@@ -117,6 +117,83 @@ def _cached_site_registry():
     return {"data": _load_site_registry()}
 
 
+# ── entity frameworks (persisted to disk) ─────────────────────────────────────
+# Structure:
+#   {
+#     "entity_001": {
+#       "name": "Southside Medical Center",
+#       "340B_ID": "SMC340B-001",
+#       "carve_status": "carve-in",     # "carve-in" | "carve-out" | "unknown"
+#       "sites": {
+#         "106540": {
+#           "address": "1046 Ridge Ave SW, Atlanta, GA 30315",
+#           "site_type": "340B"          # "340B" | "retail"
+#         }
+#       }
+#     }
+#   }
+_ENTITY_FW = Path(__file__).resolve().parent / "entity_frameworks.json"
+
+
+def _load_entity_framework() -> dict:
+    """Load entity frameworks from disk; returns {} if not present."""
+    if _ENTITY_FW.exists():
+        try:
+            with open(_ENTITY_FW) as _f:
+                return json.load(_f)
+        except Exception:
+            pass
+    return {}
+
+
+def _save_entity_framework(fw: dict) -> None:
+    """Persist entity frameworks to disk and bust cache."""
+    with open(_ENTITY_FW, "w") as _f:
+        json.dump(fw, _f, indent=2)
+    _cached_entity_framework.clear()
+
+
+@st.cache_resource
+def _cached_entity_framework():
+    """Cache entity frameworks across reruns."""
+    return {"data": _load_entity_framework()}
+
+
+def _build_entity_lookup(fw: dict) -> dict:
+    """
+    Flatten entity frameworks into a store-ID → entity-info dict.
+
+    Returns
+    -------
+    {store_id: {entity_id, name, b340_id, carve_status, site_type, address}}
+    """
+    lookup: dict = {}
+    for eid, edata in fw.items():
+        for sid, sdata in edata.get("sites", {}).items():
+            lookup[str(sid).strip()] = {
+                "entity_id":    eid,
+                "name":         edata.get("name", ""),
+                "b340_id":      edata.get("340B_ID", ""),
+                "carve_status": edata.get("carve_status", "unknown"),
+                "site_type":    sdata.get("site_type", "340B"),
+                "address":      sdata.get("address", ""),
+            }
+    return lookup
+
+
+def _addr_keywords(address: str) -> list[str]:
+    """Extract searchable uppercase keywords from a site address string."""
+    upper = address.upper().strip()
+    parts = [p.strip() for p in upper.split(",") if p.strip()]
+    kws: list[str] = []
+    if parts:
+        kws.append(parts[0])          # full street: "1046 RIDGE AVE SW"
+        words = parts[0].split()
+        if len(words) >= 2:
+            kws.append(" ".join(words[:2]))   # "1046 RIDGE" — most unique
+    return kws
+
+
 # ── sidebar ───────────────────────────────────────────────────────────────────
 
 st.sidebar.header("Data inputs")
@@ -230,6 +307,10 @@ st.markdown("---")
 st.subheader("🏥  Site Carve Status")
 carve_cols = st.columns([2, 3])
 with carve_cols[0]:
+    _auto_carve    = st.session_state.get("_auto_carve", "unknown")
+    _carve_index   = {"unknown": 0, "carve-in": 1, "carve-out": 2}.get(_auto_carve, 0)
+    if _auto_carve != "unknown":
+        st.caption(f"🏢 Auto-detected from Entity Framework: **{_auto_carve}**")
     carve_status = st.radio(
         "Select your covered entity's Medicaid FFS carve-in / carve-out election",
         options=["unknown", "carve-in", "carve-out"],
@@ -238,7 +319,8 @@ with carve_cols[0]:
             "carve-in":  "✅  Carve-In — Entity uses 340B drugs for Medicaid FFS; listed on HRSA MEF",
             "carve-out": "🚫  Carve-Out — Entity purchases at WAC for Medicaid FFS; NOT on MEF",
         }[x],
-        index=0,
+        index=_carve_index,
+        key="_carve_radio",
     )
 with carve_cols[1]:
     carve_help = {
@@ -314,6 +396,28 @@ if uploaded_file is not None:
         st.session_state["_wb_file_id"]  = file_id
         st.session_state["_wb_path"]     = _write_temp(wb_bytes, suffix)
         st.session_state["_wb_format"]   = _fmt
+        # Auto-detect carve status from entity framework
+        try:
+            _fw_lkup = _build_entity_lookup(_cached_entity_framework()["data"])
+            if _fw_lkup:
+                if _fmt == "csv":
+                    import io as _io
+                    _peek = pd.read_csv(_io.BytesIO(wb_bytes), nrows=5, dtype=str)
+                elif _fmt == "excel_rxlog":
+                    import io as _io
+                    _px2 = pd.ExcelFile(_io.BytesIO(wb_bytes))
+                    _peek = _px2.parse(_px2.sheet_names[0], nrows=5, dtype=str)
+                else:
+                    _peek = pd.DataFrame()
+                if "RX STOREID" in _peek.columns:
+                    _detected_sids = set(_peek["RX STOREID"].astype(str).str.strip().unique())
+                    _carve_set = {_fw_lkup[s]["carve_status"] for s in _detected_sids if s in _fw_lkup}
+                    if len(_carve_set) == 1:
+                        st.session_state["_auto_carve"] = _carve_set.pop()
+                    else:
+                        st.session_state["_auto_carve"] = "unknown"
+        except Exception:
+            pass
     source_path  = st.session_state["_wb_path"]
     input_format = st.session_state.get("_wb_format", "excel")
     if input_format in ("csv", "excel_rxlog"):
@@ -385,7 +489,7 @@ if exceptions_file is not None:
 
 @st.cache_data(show_spinner=False)
 def _load_results(path, pm_json, mef_json, exc_json, rules_json, carve,
-                  fmt="excel", site_reg_json=None) -> dict:
+                  fmt="excel", site_reg_json=None, entity_fw_json=None) -> dict:
     rules = json.loads(rules_json)
 
     def _rj(j):
@@ -396,30 +500,83 @@ def _load_results(path, pm_json, mef_json, exc_json, rules_json, carve,
     mef = _rj(mef_json) if mef_json else None
     exc = _rj(exc_json) if exc_json else None
 
+    # Build entity lookup once
+    _entity_fw   = json.loads(entity_fw_json) if entity_fw_json else {}
+    _entity_lkup = _build_entity_lookup(_entity_fw)
+
     # ── helpers shared by CSV and Excel-RX-log paths ──────────────────────────
-    def _apply_site_reg(sm_df, se_df):
-        """Inject registered 340B ID + Covered entity into store_map / site_entity_map."""
-        if not site_reg_json:
-            return sm_df, se_df
-        for _sid, _reg in json.loads(site_reg_json).items():
-            _b340   = str(_reg.get("340B ID", "")).strip()
-            _entity = str(_reg.get("Covered entity", "")).strip()
-            if not _b340:
-                continue
-            _sm = sm_df["Store number"].astype(str).str.strip() == str(_sid).strip()
-            if _sm.any():
-                sm_df.loc[_sm, "340B ID"]        = _b340
-                sm_df.loc[_sm, "Covered entity"] = _entity
-            _se = se_df["Site location"].astype(str).str.strip() == str(_sid).strip()
-            if _se.any():
-                se_df.loc[_se, "340B ID"]        = _b340
-                se_df.loc[_se, "Covered entity"] = _entity
-        return sm_df, se_df
+    def _apply_entity_and_site_reg(sm_df, se_df, raw_df):
+        """
+        1. Apply entity framework (higher priority):
+           - 340B sites → inject 340B ID + Covered entity + Site type='340B'
+           - Retail sites → inject Site type='Retail', leave 340B ID blank
+        2. Apply site registry (lower priority, fills gaps not covered by entity fw)
+        3. Add 'Prescriber address check' to raw_df via DOCADD1 match
+        """
+        # ── Step 1: entity framework ──────────────────────────────────────────
+        if _entity_lkup:
+            if "Site type" not in sm_df.columns:
+                sm_df["Site type"] = ""
+            for _sid, _info in _entity_lkup.items():
+                _sm_mask = sm_df["Store number"].astype(str).str.strip() == _sid
+                if not _sm_mask.any():
+                    continue
+                _se_mask = se_df["Site location"].astype(str).str.strip() == _sid
+
+                if _info["site_type"].upper() == "RETAIL":
+                    # Retail: mark as retail, no 340B credentials
+                    sm_df.loc[_sm_mask, "Site type"] = "Retail"
+                else:
+                    # 340B site: inject credentials
+                    _b340   = _info["b340_id"]
+                    _entity = _info["name"]
+                    if _b340:
+                        sm_df.loc[_sm_mask, "340B ID"]        = _b340
+                        sm_df.loc[_sm_mask, "Covered entity"] = _entity
+                        sm_df.loc[_sm_mask, "Site type"]      = "340B"
+                        if _se_mask.any():
+                            se_df.loc[_se_mask, "340B ID"]        = _b340
+                            se_df.loc[_se_mask, "Covered entity"] = _entity
+
+        # ── Step 2: site registry (gap-fill only) ─────────────────────────────
+        if site_reg_json:
+            for _sid, _reg in json.loads(site_reg_json).items():
+                _b340   = str(_reg.get("340B ID", "")).strip()
+                _entity = str(_reg.get("Covered entity", "")).strip()
+                if not _b340:
+                    continue
+                _sm_mask = sm_df["Store number"].astype(str).str.strip() == str(_sid).strip()
+                # Only fill if entity framework hasn't already set a 340B ID
+                _already = sm_df.loc[_sm_mask, "340B ID"].astype(str).str.strip().ne("").any() if _sm_mask.any() else False
+                if _sm_mask.any() and not _already:
+                    sm_df.loc[_sm_mask, "340B ID"]        = _b340
+                    sm_df.loc[_sm_mask, "Covered entity"] = _entity
+                _se_mask = se_df["Site location"].astype(str).str.strip() == str(_sid).strip()
+                _se_already = se_df.loc[_se_mask, "340B ID"].astype(str).str.strip().ne("").any() if _se_mask.any() else False
+                if _se_mask.any() and not _se_already:
+                    se_df.loc[_se_mask, "340B ID"]        = _b340
+                    se_df.loc[_se_mask, "Covered entity"] = _entity
+
+        # ── Step 3: DOCADD1 prescriber address check ──────────────────────────
+        # Build keyword list from entity framework site addresses
+        _addr_kws: list[str] = []
+        for _info in _entity_lkup.values():
+            _addr_kws.extend(_addr_keywords(_info.get("address", "")))
+        _addr_kws = [k for k in _addr_kws if k]  # remove empty
+
+        if _addr_kws and "DOCADD1" in raw_df.columns:
+            _docadd1 = raw_df["DOCADD1"].fillna("").astype(str).str.upper()
+            raw_df["Prescriber address check"] = _docadd1.apply(
+                lambda v: "PASS" if any(kw in v for kw in _addr_kws) else "REVIEW"
+            )
+        # else: engine defaults to N/A
+
+        return sm_df, se_df, raw_df
 
     def _audit_rxlog(raw_df):
-        """Map RX-log columns → canonical, apply site registry, run engine."""
+        """Map RX-log columns → canonical, apply framework+registry, run engine."""
         raw_df, sm_df, se_df = map_rx_log(raw_df)
-        sm_df, se_df = _apply_site_reg(sm_df, se_df)
+        sm_df, se_df, raw_df = _apply_entity_and_site_reg(sm_df, se_df, raw_df)
         return audit_dataframe(
             raw=raw_df, store_map=sm_df, site_entity_map=se_df,
             provider_master=pm, mef=mef, exceptions=exc,
@@ -463,17 +620,19 @@ def _reconstruct(cached: dict) -> dict[str, pd.DataFrame]:
     return {k: pd.DataFrame(**v) for k, v in cached.items()}
 
 
-rules_json    = json.dumps(load_rules())
-pm_json       = provider_master_df.to_json() if provider_master_df is not None else None
-mef_json      = mef_df.to_json()             if mef_df             is not None else None
-exc_json      = exceptions_df.to_json()      if exceptions_df       is not None else None
-_site_reg_raw = _cached_site_registry()["data"]
-site_reg_json = json.dumps(_site_reg_raw) if _site_reg_raw else None
+rules_json      = json.dumps(load_rules())
+pm_json         = provider_master_df.to_json() if provider_master_df is not None else None
+mef_json        = mef_df.to_json()             if mef_df             is not None else None
+exc_json        = exceptions_df.to_json()      if exceptions_df       is not None else None
+_site_reg_raw   = _cached_site_registry()["data"]
+site_reg_json   = json.dumps(_site_reg_raw) if _site_reg_raw else None
+_entity_fw_raw  = _cached_entity_framework()["data"]
+entity_fw_json  = json.dumps(_entity_fw_raw) if _entity_fw_raw else None
 
 with st.spinner("Running decision engine…"):
     try:
         cached = _load_results(source_path, pm_json, mef_json, exc_json, rules_json,
-                               carve_status, input_format, site_reg_json)
+                               carve_status, input_format, site_reg_json, entity_fw_json)
     except ValueError as _ve:
         _msg = str(_ve)
         if "not found" in _msg.lower() or "worksheet" in _msg.lower():
@@ -680,12 +839,13 @@ st.markdown("---")
 # TABS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-tab_queue, tab_all, tab_store, tab_exc, tab_prov, tab_dl = st.tabs([
+tab_queue, tab_all, tab_store, tab_exc, tab_prov, tab_entity, tab_dl = st.tabs([
     "⚠️ Review Queue",
     "📄 All Claims",
     "🏪 Store Status",
     "📋 Exception Management",
     "👨‍⚕️ Provider Registry",
+    "🏢 Entity Frameworks",
     "⬇ Downloads",
 ])
 
@@ -1306,7 +1466,213 @@ with tab_prov:
                 st.rerun()
 
 
-# ── TAB 6: Downloads ──────────────────────────────────────────────────────────
+# ── TAB 6: Entity Frameworks ──────────────────────────────────────────────────
+
+with tab_entity:
+    st.subheader("Entity Frameworks")
+    st.caption(
+        "Define covered entities and their dispensing sites. "
+        "When a file is uploaded, the engine auto-recognises the entity, applies the correct "
+        "carve status, validates prescriber addresses against known site addresses, and flags "
+        "retail-only stores that cannot use 340B pricing."
+    )
+
+    _ef = _cached_entity_framework()["data"]
+
+    # ── Status banner ─────────────────────────────────────────────────────────
+    if _ef:
+        _ef_total_sites = sum(len(v.get("sites", {})) for v in _ef.values())
+        st.success(
+            f"🏢 {len(_ef)} entit{'y' if len(_ef)==1 else 'ies'} configured · "
+            f"{_ef_total_sites} site(s) registered"
+        )
+    else:
+        st.info(
+            "No entity frameworks configured. Add your first entity below to enable "
+            "auto-recognition, carve status auto-detection, and prescriber address validation."
+        )
+
+    st.markdown("---")
+
+    # ── ADD / EDIT ENTITY ─────────────────────────────────────────────────────
+    st.markdown("### Add / Edit Entity")
+    with st.form("ef_add_entity_form"):
+        _ef_c1, _ef_c2, _ef_c3 = st.columns(3)
+        _ef_entity_id   = _ef_c1.text_input(
+            "Entity ID (short key)",
+            placeholder="e.g. smc, map_health",
+            help="Unique short key — letters, numbers, underscores. e.g. 'smc' or 'map_health'",
+            key="ef_entity_id",
+        )
+        _ef_entity_name = _ef_c2.text_input(
+            "Entity name",
+            placeholder="e.g. Southside Medical Center",
+            key="ef_entity_name",
+        )
+        _ef_b340_id     = _ef_c3.text_input(
+            "340B ID",
+            placeholder="e.g. SMC340B-001",
+            key="ef_b340_id",
+        )
+        _ef_carve       = st.radio(
+            "Carve status for this entity",
+            options=["carve-in", "carve-out", "unknown"],
+            horizontal=True,
+            key="ef_carve",
+        )
+        if st.form_submit_button("💾 Save entity", type="primary"):
+            _eid = _ef_entity_id.strip().lower().replace(" ", "_")
+            if not _eid:
+                st.error("Entity ID is required.")
+            elif not _ef_entity_name.strip():
+                st.error("Entity name is required.")
+            else:
+                # Preserve existing sites when editing
+                _existing_sites = _ef.get(_eid, {}).get("sites", {})
+                _ef[_eid] = {
+                    "name":         _ef_entity_name.strip(),
+                    "340B_ID":      _ef_b340_id.strip(),
+                    "carve_status": _ef_carve,
+                    "sites":        _existing_sites,
+                }
+                _save_entity_framework(_ef)
+                st.success(f"Entity '{_ef_entity_name.strip()}' saved.")
+                st.rerun()
+
+    st.markdown("---")
+
+    # ── PER-ENTITY SITE MANAGEMENT ────────────────────────────────────────────
+    if _ef:
+        st.markdown("### Manage Sites")
+        _sel_entity_label = st.selectbox(
+            "Select entity to manage",
+            options=list(_ef.keys()),
+            format_func=lambda k: f"{_ef[k]['name']} ({k})",
+            key="ef_sel_entity",
+        )
+        _sel_e = _ef.get(_sel_entity_label, {})
+        _sel_sites = _sel_e.get("sites", {})
+
+        st.markdown(
+            f"**{_sel_e.get('name', '')}** · 340B ID: `{_sel_e.get('340B_ID', 'N/A')}` "
+            f"· Carve status: **{_sel_e.get('carve_status', 'unknown')}**"
+        )
+
+        # Show existing sites
+        if _sel_sites:
+            st.markdown(f"**{len(_sel_sites)} site(s):**")
+            for _site_id, _site_data in list(_sel_sites.items()):
+                _type_badge = (
+                    "<span style='background:#27ae60;color:white;border-radius:10px;"
+                    "padding:2px 8px;font-size:0.75em'>340B</span>"
+                    if _site_data.get("site_type", "340B").upper() == "340B"
+                    else
+                    "<span style='background:#e67e22;color:white;border-radius:10px;"
+                    "padding:2px 8px;font-size:0.75em'>Retail</span>"
+                )
+                _col_info, _col_remove = st.columns([6, 1])
+                _col_info.markdown(
+                    f"**Store {_site_id}** {_type_badge} — {_site_data.get('address', 'No address')}",
+                    unsafe_allow_html=True,
+                )
+                if _col_remove.button("Remove", key=f"ef_rm_{_sel_entity_label}_{_site_id}"):
+                    del _sel_sites[_site_id]
+                    _ef[_sel_entity_label]["sites"] = _sel_sites
+                    _save_entity_framework(_ef)
+                    st.rerun()
+        else:
+            st.info("No sites configured for this entity yet.")
+
+        st.markdown("#### Add site")
+        with st.form(f"ef_add_site_{_sel_entity_label}"):
+            _sa_c1, _sa_c2, _sa_c3 = st.columns(3)
+            _sa_store = _sa_c1.text_input(
+                "Store / Site number",
+                placeholder="e.g. 106540",
+                key=f"ef_sa_store_{_sel_entity_label}",
+            )
+            _sa_addr  = _sa_c2.text_input(
+                "Site address",
+                placeholder="e.g. 1046 Ridge Ave SW, Atlanta, GA 30315",
+                key=f"ef_sa_addr_{_sel_entity_label}",
+            )
+            _sa_type  = _sa_c3.selectbox(
+                "Site type",
+                options=["340B", "Retail"],
+                help="340B = eligible dispense site. Retail = standard retail, not 340B.",
+                key=f"ef_sa_type_{_sel_entity_label}",
+            )
+            if st.form_submit_button("➕ Add site"):
+                _sid = _sa_store.strip()
+                if not _sid:
+                    st.error("Store number is required.")
+                else:
+                    _ef[_sel_entity_label]["sites"][_sid] = {
+                        "address":   _sa_addr.strip(),
+                        "site_type": _sa_type,
+                    }
+                    _save_entity_framework(_ef)
+                    # Also sync 340B sites to site registry
+                    if _sa_type == "340B" and _sel_e.get("340B_ID"):
+                        _sr = _cached_site_registry()["data"]
+                        _sr[_sid] = {
+                            "340B ID":       _sel_e["340B_ID"],
+                            "Covered entity": _sel_e["name"],
+                        }
+                        _save_site_registry(_sr)
+                    st.success(f"Site {_sid} added as {_sa_type}.")
+                    st.rerun()
+
+        # ── Import from current audit ──────────────────────────────────────────
+        st.markdown("#### Import stores from current audit")
+        st.caption(
+            "Bulk-add all stores detected in the current audit as 340B sites for this entity. "
+            "You can change individual sites to 'Retail' after importing."
+        )
+        _audit_stores = (
+            store_status[["Store number", "Pharmacy location"]]
+            .drop_duplicates("Store number")
+            .values.tolist()
+        )
+        _import_new = [(s, a) for s, a in _audit_stores if str(s) not in _sel_sites]
+        if _import_new:
+            if st.button(
+                f"Import {len(_import_new)} new store(s) as 340B sites",
+                key=f"ef_import_{_sel_entity_label}",
+            ):
+                for _isid, _iaddr in _import_new:
+                    _ef[_sel_entity_label]["sites"][str(_isid)] = {
+                        "address":   str(_iaddr),
+                        "site_type": "340B",
+                    }
+                _save_entity_framework(_ef)
+                # Sync to site registry
+                _sr = _cached_site_registry()["data"]
+                for _isid, _ in _import_new:
+                    if _sel_e.get("340B_ID"):
+                        _sr[str(_isid)] = {
+                            "340B ID":       _sel_e["340B_ID"],
+                            "Covered entity": _sel_e["name"],
+                        }
+                _save_site_registry(_sr)
+                st.success(f"Imported {len(_import_new)} store(s) as 340B sites.")
+                st.rerun()
+        else:
+            st.info("All current audit stores are already in this entity's site list.")
+
+        st.markdown("---")
+
+        # ── Danger zone ───────────────────────────────────────────────────────
+        with st.expander("Danger zone"):
+            st.warning(f"This will permanently delete entity '{_sel_e.get('name', _sel_entity_label)}'.")
+            if st.button(f"Delete entity '{_sel_entity_label}'", type="secondary", key=f"ef_del_{_sel_entity_label}"):
+                del _ef[_sel_entity_label]
+                _save_entity_framework(_ef)
+                st.success("Entity deleted.")
+                st.rerun()
+
+
+# ── TAB 7: Downloads ──────────────────────────────────────────────────────────
 
 with tab_dl:
     st.subheader("Downloads")

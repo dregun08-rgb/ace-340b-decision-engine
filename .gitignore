@@ -5,6 +5,7 @@ __pycache__/
 rules_config.json
 provider_registry.json
 site_registry.json
+entity_frameworks.json
 .DS_Store
 *.egg-info/
 dist/

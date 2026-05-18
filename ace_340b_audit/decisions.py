@@ -110,7 +110,7 @@ def categorize_claim(row: object) -> str:
     if rv("Duplicate check") == "REVIEW":
         return DUPLICATE_DISCOUNT
 
-    if rv("Prescriber check") == "REVIEW":
+    if rv("Prescriber check") == "REVIEW" or rv("Prescriber address check") == "REVIEW":
         return INELIGIBLE_PRESCRIBER
 
     if rv("Store map") == "REVIEW" or rv("Entity map") == "REVIEW":
@@ -164,6 +164,8 @@ def generate_action_plan(row: object, carve_status: str = "unknown") -> str:
     ndc_check    = g("NDC check")
     store_map    = g("Store map")
     entity_map   = g("Entity map")
+    site_type    = g("Site type", "")
+    prescriber_addr_check = g("Prescriber address check", "N/A")
 
     mef_check  = g("MEF check",  "N/A")
     mef_detail = g("MEF detail", "No MEF file uploaded")
@@ -185,6 +187,8 @@ def generate_action_plan(row: object, carve_status: str = "unknown") -> str:
         fill_date=fill_date, dup_reason=dup_reason, missing_list=missing_list,
         npi_check=npi_check, ndc_check=ndc_check,
         store_map=store_map, entity_map=entity_map,
+        site_type=site_type,
+        prescriber_addr_check=prescriber_addr_check,
         carve_status=carve_status,
         mef_check=mef_check, mef_detail=mef_detail,
         mef_inconsistency=mef_inconsistency,
@@ -242,13 +246,22 @@ demonstrating an encounter with a patient of the entity."""
 
 
 def _action_ineligible_prescriber(
-    *, rx, prescriber, npi, entity, b340_id, **_
+    *, rx, prescriber, npi, entity, b340_id, prescriber_addr_check="N/A", **_
 ) -> str:
+    addr_note = ""
+    if str(prescriber_addr_check).upper() == "REVIEW":
+        addr_note = (
+            "\n⚠️  PRESCRIBER ADDRESS MISMATCH — The prescriber's practice address "
+            "does not match any known site address for this entity. "
+            "This prescriber may be practicing at an external location not associated "
+            "with the covered entity. Verify site affiliation before adding to the "
+            "provider master.\n"
+        )
     return f"""\
 ⚕️  INELIGIBLE PRESCRIBER — Eligibility Verification Required
 
 Rx# {rx}  |  Prescriber: {prescriber}  |  NPI: {npi}
-Entity: {entity}  |  340B ID: {b340_id}
+Entity: {entity}  |  340B ID: {b340_id}{addr_note}
 
 {prescriber} (NPI: {npi}) is not currently in the eligible prescriber
 master for this covered entity.
@@ -287,8 +300,29 @@ by an eligible entity prescriber with proper documentation."""
 
 def _action_wrong_site(
     *, rx, store, pharmacy, site, enc_site, entity, b340_id,
-    store_map, entity_map, **_
+    store_map, entity_map, site_type="", **_
 ) -> str:
+    # ── Retail site: known non-340B dispense location ─────────────────────────
+    if str(site_type).strip().upper() == "RETAIL":
+        return (
+            f"🏪  RETAIL SITE — Not a 340B Eligible Dispense Location\n\n"
+            f"Rx# {rx}  |  Store: {store}  |  Pharmacy: {pharmacy}\n\n"
+            f"Store {store} ({pharmacy}) is configured as a RETAIL pharmacy in your\n"
+            f"Entity Framework. Retail locations are not registered 340B dispensing\n"
+            f"sites and cannot bill claims under the 340B programme.\n\n"
+            f"─── Required Actions ───────────────────────────────────────────────\n"
+            f"1. Reverse the 340B discount on Rx# {rx}.\n"
+            f"2. Reprocess as a standard retail (non-340B) claim at full cost.\n"
+            f"3. If this store should be a 340B site:\n"
+            f"   → Update your Entity Framework (Entity Frameworks tab) and change\n"
+            f"     its Site Type from 'Retail' to '340B'.\n"
+            f"   → Register it with HRSA as a contract pharmacy if needed:\n"
+            f"     https://340bopais.hrsa.gov\n\n"
+            f"─── Regulatory Reference ───────────────────────────────────────────\n"
+            f"Only covered entity in-house pharmacies or HRSA-registered contract\n"
+            f"pharmacies may dispense 340B drugs. [42 U.S.C. § 256b]"
+        )
+
     lines = [
         "🏥  WRONG SITE — Site/Entity Mapping Failure",
         "",

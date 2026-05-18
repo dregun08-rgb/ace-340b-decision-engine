@@ -377,7 +377,7 @@ def audit_dataframe(
     store_lookup_cols = [c for c in [
         "Store number", "Pharmacy location", "Site location",
         "Patient encounter site", "340B ID", "Covered entity",
-        "Entity site address", "Store map status",
+        "Entity site address", "Store map status", "Site type",
     ] if c in store.columns]
     df = df.merge(store[store_lookup_cols], on="Store number", how="left")
 
@@ -430,8 +430,11 @@ def audit_dataframe(
     df["NDC check"] = np.where(df["NDC"].str.fullmatch(r"\d{10,11}"),        "PASS", "REVIEW")
 
     # ── store / entity mapping checks ─────────────────────────────────────────
+    # Retail sites (from entity framework) are never valid 340B dispense sites.
+    retail_flag = _clean_string_series(_safe_col(df, "Site type")).str.upper() == "RETAIL"
     store_complete = (
-        _clean_string_series(_safe_col(df, "Pharmacy location")).ne("")
+        ~retail_flag
+        & _clean_string_series(_safe_col(df, "Pharmacy location")).ne("")
         & _clean_string_series(_safe_col(df, "Site location")).ne("")
         & _clean_string_series(_safe_col(df, "Patient encounter site")).ne("")
         & _clean_string_series(_safe_col(df, "340B ID")).ne("")
@@ -463,6 +466,17 @@ def audit_dataframe(
     df["Duplicate check"]  = dup_check
     df["Duplicate reason"] = dup_reason
 
+    # ── prescriber address check (DOCADD1 vs entity site addresses) ──────────
+    # Set by app.py when entity framework is configured; default N/A otherwise.
+    if "Prescriber address check" not in df.columns:
+        df["Prescriber address check"] = pd.Series(
+            ["N/A"] * len(df), index=df.index, dtype="string"
+        )
+    else:
+        df["Prescriber address check"] = _clean_string_series(
+            df["Prescriber address check"]
+        ).replace({"": "N/A"})
+
     # ── MEF (Medicaid Exclusion File) cross-reference ─────────────────────────
     if mef is not None:
         mef_check, mef_detail = _check_mef(df, mef)
@@ -478,13 +492,14 @@ def audit_dataframe(
     # ── overall status ────────────────────────────────────────────────────────
     df["Overall status"] = np.where(
         (df["Missing fields"] > 0)
-        | (df["NPI check"]            == "REVIEW")
-        | (df["NDC check"]            == "REVIEW")
-        | (df["Store map"]            == "REVIEW")
-        | (df["Entity map"]           == "REVIEW")
-        | (df["Prescriber check"]     == "REVIEW")
-        | (df["Encounter date check"] == "REVIEW")
-        | (df["Duplicate check"]      == "REVIEW"),
+        | (df["NPI check"]                == "REVIEW")
+        | (df["NDC check"]                == "REVIEW")
+        | (df["Store map"]                == "REVIEW")
+        | (df["Entity map"]               == "REVIEW")
+        | (df["Prescriber check"]         == "REVIEW")
+        | (df["Encounter date check"]     == "REVIEW")
+        | (df["Duplicate check"]          == "REVIEW")
+        | (df["Prescriber address check"] == "REVIEW"),
         "REVIEW",
         "PASS",
     )
@@ -499,7 +514,8 @@ def audit_dataframe(
         - np.where(df["Entity map"]           == "REVIEW", int(scoring["entity_map_penalty"]),                        0)
         - np.where(df["Prescriber check"]     == "REVIEW", int(scoring["prescriber_not_in_master_penalty"]),          0)
         - np.where(df["Encounter date check"] == "REVIEW", int(scoring["encounter_date_out_of_window_penalty"]),      0)
-        - np.where(df["Duplicate check"]      == "REVIEW", int(scoring["duplicate_discount_penalty"]),                0)
+        - np.where(df["Duplicate check"]          == "REVIEW", int(scoring["duplicate_discount_penalty"]),                0)
+        - np.where(df["Prescriber address check"] == "REVIEW", int(scoring.get("prescriber_address_penalty", 15)),       0)
     ).clip(lower=0)
 
     high_max = int(thresholds["high_risk_max"])
@@ -520,13 +536,14 @@ def audit_dataframe(
     # ── legacy issue columns (kept for backwards compat) ─────────────────────
     conditions = [
         df["Missing fields"] > 0,
-        df["NPI check"]            == "REVIEW",
-        df["NDC check"]            == "REVIEW",
-        df["Store map"]            == "REVIEW",
-        df["Entity map"]           == "REVIEW",
-        df["Prescriber check"]     == "REVIEW",
-        df["Encounter date check"] == "REVIEW",
-        df["Duplicate check"]      == "REVIEW",
+        df["NPI check"]                == "REVIEW",
+        df["NDC check"]                == "REVIEW",
+        df["Store map"]                == "REVIEW",
+        df["Entity map"]               == "REVIEW",
+        df["Prescriber check"]         == "REVIEW",
+        df["Encounter date check"]     == "REVIEW",
+        df["Duplicate check"]          == "REVIEW",
+        df["Prescriber address check"] == "REVIEW",
     ]
     choices = [
         "Missing required fields",
@@ -537,6 +554,7 @@ def audit_dataframe(
         "Prescriber not in master",
         "Encounter date out of window",
         "Duplicate discount flag",
+        "Prescriber address mismatch",
     ]
     df["Primary issue"] = np.select(conditions, choices, default="Clean")
     df["Issue bucket"]  = np.where(df["Overall status"] == "PASS", "Compliant", df["Primary issue"])

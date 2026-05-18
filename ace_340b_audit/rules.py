@@ -15,6 +15,7 @@ DEFAULT_RULES: dict[str, Any] = {
         "prescriber_not_in_master_penalty": 15,
         "encounter_date_out_of_window_penalty": 20,
         "duplicate_discount_penalty": 25,
+        "prescriber_address_penalty": 15,
     },
     "thresholds": {
         "high_risk_max": 69,
