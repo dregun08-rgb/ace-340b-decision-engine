@@ -308,10 +308,10 @@ else:
     st.sidebar.info("👨‍⚕️ No provider registry saved. Go to the Provider Registry tab to add your site providers.")
 
 provider_master_file = st.sidebar.file_uploader(
-    "Provider master CSV — one-time upload (optional)",
-    type=["csv"],
+    "Provider master — one-time upload (optional)",
+    type=["csv", "xlsx", "xls"],
     help=(
-        "CSV with 'NPI' or 'Provider NPI' column for a one-time session upload. "
+        "CSV or Excel file with 'NPI' or 'Provider NPI' column for a one-time session upload. "
         "To persist providers across sessions, use the Provider Registry tab."
     ),
 )
@@ -593,7 +593,11 @@ provider_master_df: pd.DataFrame | None = _cached_registry()["df"]
 
 if provider_master_file is not None:
     try:
-        _upload_pm = pd.read_csv(provider_master_file)
+        _pm_name = provider_master_file.name.lower()
+        if _pm_name.endswith((".xlsx", ".xls")):
+            _upload_pm = pd.read_excel(provider_master_file, dtype=str)
+        else:
+            _upload_pm = pd.read_csv(provider_master_file)
         if provider_master_df is not None and not provider_master_df.empty:
             # Merge session upload on top of registry (union, deduplicated)
             provider_master_df = (
