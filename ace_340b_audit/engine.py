@@ -39,9 +39,12 @@ DERIVED_COLUMNS = [
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def _clean_string_series(series: pd.Series) -> pd.Series:
+    # Use astype(str) — always yields object dtype, never string[pyarrow].
+    # Streamlit Cloud's PyArrow backend turns astype("string") into
+    # ArrowDtype, making boolean ops (e.g. .eq("")) return bool[pyarrow],
+    # which cannot be added to int64 (raises 'radd not supported').
     return (
-        series.astype("string")
-        .fillna("")
+        series.astype(str)
         .str.strip()
         .replace({"<NA>": "", "nan": "", "None": ""})
     )
@@ -66,7 +69,7 @@ def _read_sheet(path: str | Path, sheet_name: str) -> pd.DataFrame:
 def _safe_col(df: pd.DataFrame, col: str) -> pd.Series:
     if col in df.columns:
         return df[col]
-    return pd.Series([""] * len(df), index=df.index, dtype="string")
+    return pd.Series([""] * len(df), index=df.index, dtype=object)
 
 
 def _truthy(series: pd.Series) -> pd.Series:
@@ -93,7 +96,7 @@ def _check_prescriber_master(df: pd.DataFrame, provider_master: pd.DataFrame) ->
         None,
     )
     if npi_col is None:
-        return pd.Series(["N/A"] * len(df), index=df.index, dtype="string")
+        return pd.Series(["N/A"] * len(df), index=df.index, dtype=object)
 
     valid_npis: set[str] = set(_normalize_npi(provider_master[npi_col])) - {""}
     result = np.where(
@@ -101,12 +104,12 @@ def _check_prescriber_master(df: pd.DataFrame, provider_master: pd.DataFrame) ->
         "REVIEW",
         np.where(df["Provider NPI"].isin(valid_npis), "PASS", "REVIEW"),
     )
-    return pd.Series(result, index=df.index, dtype="string")
+    return pd.Series(result, index=df.index, dtype=object)
 
 
 def _check_encounter_date(df: pd.DataFrame, window_days: int = 365) -> pd.Series:
     if "Encounter date" not in df.columns:
-        return pd.Series(["N/A"] * len(df), index=df.index, dtype="string")
+        return pd.Series(["N/A"] * len(df), index=df.index, dtype=object)
 
     enc = pd.to_datetime(df["Encounter date"], errors="coerce")
     fill = pd.to_datetime(df["Fill date"], errors="coerce")
@@ -114,7 +117,7 @@ def _check_encounter_date(df: pd.DataFrame, window_days: int = 365) -> pd.Series
     within_window = (fill - enc).abs() <= pd.Timedelta(days=window_days)
 
     result = np.where(~both_valid, "REVIEW", np.where(within_window, "PASS", "REVIEW"))
-    return pd.Series(result, index=df.index, dtype="string")
+    return pd.Series(result, index=df.index, dtype=object)
 
 
 def _check_duplicate_discounts(
@@ -165,9 +168,9 @@ def _check_duplicate_discounts(
     check = pd.Series(
         np.where(flag_mask, "REVIEW", "PASS"),
         index=df.index,
-        dtype="string",
+        dtype=object,
     )
-    reason = pd.Series(reasons, index=df.index, dtype="string")
+    reason = pd.Series(reasons, index=df.index, dtype=object)
     return check, reason
 
 
@@ -192,10 +195,10 @@ def _check_mef(df: pd.DataFrame, mef: pd.DataFrame) -> tuple[pd.Series, pd.Serie
         None,
     )
     if b340_col is None:
-        na = pd.Series(["N/A"] * len(df), index=df.index, dtype="string")
+        na = pd.Series(["N/A"] * len(df), index=df.index, dtype=object)
         msg = pd.Series(
             ["MEF file uploaded but no '340B ID' column found — check column headers"] * len(df),
-            index=df.index, dtype="string",
+            index=df.index, dtype=object,
         )
         return na, msg
 
@@ -256,8 +259,8 @@ def _check_mef(df: pd.DataFrame, mef: pd.DataFrame) -> tuple[pd.Series, pd.Serie
             detail_vals.append(f"340B ID {b340} not found in uploaded MEF")
 
     return (
-        pd.Series(check_vals,  index=df.index, dtype="string"),
-        pd.Series(detail_vals, index=df.index, dtype="string"),
+        pd.Series(check_vals,  index=df.index, dtype=object),
+        pd.Series(detail_vals, index=df.index, dtype=object),
     )
 
 
@@ -457,7 +460,7 @@ def audit_dataframe(
     df["Prescriber check"] = (
         _check_prescriber_master(df, provider_master)
         if provider_master is not None
-        else pd.Series(["N/A"] * len(df), index=df.index, dtype="string")
+        else pd.Series(["N/A"] * len(df), index=df.index, dtype=object)
     )
 
     df["Encounter date check"] = _check_encounter_date(df, int(thresholds["encounter_date_window_days"]))
@@ -470,7 +473,7 @@ def audit_dataframe(
     # Set by app.py when entity framework is configured; default N/A otherwise.
     if "Prescriber address check" not in df.columns:
         df["Prescriber address check"] = pd.Series(
-            ["N/A"] * len(df), index=df.index, dtype="string"
+            ["N/A"] * len(df), index=df.index, dtype=object
         )
     else:
         df["Prescriber address check"] = _clean_string_series(
@@ -481,10 +484,10 @@ def audit_dataframe(
     if mef is not None:
         mef_check, mef_detail = _check_mef(df, mef)
     else:
-        mef_check  = pd.Series(["N/A"] * len(df), index=df.index, dtype="string")
+        mef_check  = pd.Series(["N/A"] * len(df), index=df.index, dtype=object)
         mef_detail = pd.Series(
             ["No MEF file uploaded — upload via sidebar to verify carve-in/carve-out status"] * len(df),
-            index=df.index, dtype="string",
+            index=df.index, dtype=object,
         )
     df["MEF check"]  = mef_check
     df["MEF detail"] = mef_detail
