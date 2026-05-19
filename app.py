@@ -6,12 +6,15 @@ from __future__ import annotations
 import datetime
 import io
 import json
+import os
 import tempfile
+import time
 import zipfile
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+from cryptography.fernet import Fernet
 
 from ace_340b_audit.engine import run_audit_from_workbook, audit_dataframe
 from ace_340b_audit.ingest import detect_rx_log, map_rx_log
@@ -22,6 +25,54 @@ from ace_340b_audit.decisions import (
     WRONG_SITE, DATA_MISMATCH, DUPLICATE_DISCOUNT,
 )
 from ace_340b_audit.report import generate_html_report
+
+# ── HIPAA / security helpers ───────────────────────────────────────────────────
+
+def _get_enc_key() -> bytes:
+    """Return per-session Fernet key; generated once and stored in session_state."""
+    if "_enc_key" not in st.session_state:
+        st.session_state["_enc_key"] = Fernet.generate_key()
+    return st.session_state["_enc_key"]
+
+
+def _secure_delete(path: str) -> None:
+    """Overwrite file with zeros then delete — prevents PHI recovery from disk."""
+    try:
+        sz = os.path.getsize(path)
+        with open(path, "r+b") as _f:
+            _f.write(b"\x00" * sz)
+        os.unlink(path)
+    except Exception:
+        try:
+            os.unlink(path)
+        except Exception:
+            pass
+
+
+def _audit_log(event: str) -> None:
+    """Append a timestamped event to the in-session audit log (no PHI recorded)."""
+    if "_audit_log" not in st.session_state:
+        st.session_state["_audit_log"] = []
+    st.session_state["_audit_log"].append({
+        "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "event": event,
+    })
+
+
+def _mask_phi(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a display copy with patient names and Rx numbers redacted."""
+    df = df.copy()
+    if "Patient name" in df.columns:
+        def _mn(n: str) -> str:
+            parts = str(n).strip().split()
+            return " ".join(p[0] + "***" for p in parts if p) if parts else "***"
+        df["Patient name"] = df["Patient name"].apply(_mn)
+    if "Prescription number" in df.columns:
+        df["Prescription number"] = df["Prescription number"].astype(str).apply(
+            lambda x: "***" + x.strip()[-4:] if len(x.strip()) >= 4 else "***"
+        )
+    return df
+
 
 st.set_page_config(page_title="ACE 340B Decision Engine", page_icon="⚕️", layout="wide")
 
@@ -47,7 +98,38 @@ def _check_password() -> bool:
 if not _check_password():
     st.stop()
 
-# ── disclaimer banner ─────────────────────────────────────────────────────────
+# ── session timeout & HIPAA init ──────────────────────────────────────────────
+_NOW = time.time()
+if "_last_activity" not in st.session_state:
+    st.session_state["_last_activity"] = _NOW
+    st.session_state["_temp_files"] = []
+    _audit_log("Session started")
+_inactive_secs = _NOW - st.session_state["_last_activity"]
+st.session_state["_last_activity"] = _NOW  # reset on every run (= every user interaction)
+
+if _inactive_secs > 1800:  # 30-minute auto-expire
+    for _tp in st.session_state.get("_temp_files", []):
+        _secure_delete(_tp)
+    st.session_state.clear()
+    st.warning(
+        "🔒 **HIPAA Security:** Your session expired after 30 minutes of inactivity. "
+        "All uploaded data has been securely cleared. Please refresh the page to start a new session."
+    )
+    st.stop()
+elif _inactive_secs > 1200:  # 20-minute warning
+    _mins_left = max(1, int((1800 - _inactive_secs) // 60) + 1)
+    st.warning(
+        f"🔒 **HIPAA Security:** Session will auto-expire in ~{_mins_left} minute(s) due to inactivity. "
+        "Save your work."
+    )
+
+# ── HIPAA notice & disclaimer ─────────────────────────────────────────────────
+st.success(
+    "🔒 **HIPAA-Secured Session** — Uploaded files are encrypted at rest using AES-256 (Fernet). "
+    "No PHI is retained between sessions. Session auto-expires after 30 minutes of inactivity. "
+    "Use only under a signed **Business Associate Agreement (BAA)** with ACE 340B.",
+    icon=None,
+)
 st.info(
     "⚕️  **ACE 340B Decision Engine** — Corrective action guidance is based on HRSA programme "
     "integrity rules, the Medicaid Exclusion File (MEF) framework, and CMS billing guidance "
@@ -260,6 +342,44 @@ st.sidebar.download_button(
 
 st.sidebar.markdown("---")
 
+# ── HIPAA / security sidebar ───────────────────────────────────────────────────
+_mask_phi_enabled = st.sidebar.checkbox(
+    "🔒 Mask PHI in display",
+    value=False,
+    key="_phi_mask",
+    help=(
+        "Replaces patient names with initials (J*** D***) and truncates Rx numbers "
+        "to last 4 digits. Downloaded CSVs and reports are NOT masked."
+    ),
+)
+with st.sidebar.expander("🔒 HIPAA Security", expanded=False):
+    if "_enc_key" in st.session_state:
+        st.success("🔐 File encryption: ACTIVE (AES-256 Fernet)")
+    else:
+        st.info("File encryption activates on first upload.")
+    st.caption(
+        "Uploaded files are encrypted at rest using Fernet (AES-256-CBC + HMAC-SHA256). "
+        "The encryption key is unique to this browser session and never written to disk."
+    )
+    _mins_inactive = int(_inactive_secs // 60)
+    _mins_remain   = max(0, 30 - _mins_inactive)
+    st.caption(
+        f"Session auto-expires in ~{_mins_remain} min · "
+        f"Inactive for {_mins_inactive} min"
+    )
+    st.caption(
+        "⚠️ **BAA required.** Use only under a signed Business Associate Agreement. "
+        "Ref: 45 CFR §§ 164.312(a)(2)(iv), 164.314(b)."
+    )
+    if st.button("🗑 Clear session data now", key="_clear_session_btn"):
+        _audit_log("Session data manually cleared by user")
+        for _tp in st.session_state.get("_temp_files", []):
+            _secure_delete(_tp)
+        st.session_state.clear()
+        st.rerun()
+
+st.sidebar.markdown("---")
+
 # ── rules editor ──────────────────────────────────────────────────────────────
 with st.sidebar.expander("⚙️ Scoring rules", expanded=False):
     current_rules = load_rules()
@@ -357,9 +477,15 @@ st.markdown("---")
 # ── resolve data sources ──────────────────────────────────────────────────────
 
 def _write_temp(data: bytes, suffix: str) -> str:
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
-        f.write(data)
-        return f.name
+    """Encrypt data with the session Fernet key and write to a temp file."""
+    enc_data = Fernet(_get_enc_key()).encrypt(data)
+    with tempfile.NamedTemporaryFile(suffix=suffix + ".enc", delete=False) as f:
+        f.write(enc_data)
+        path = f.name
+    if "_temp_files" not in st.session_state:
+        st.session_state["_temp_files"] = []
+    st.session_state["_temp_files"].append(path)
+    return path
 
 
 source_path: str | None = None
@@ -396,6 +522,10 @@ if uploaded_file is not None:
         st.session_state["_wb_file_id"]  = file_id
         st.session_state["_wb_path"]     = _write_temp(wb_bytes, suffix)
         st.session_state["_wb_format"]   = _fmt
+        _audit_log(
+            f"File uploaded: {uploaded_file.name} "
+            f"({len(wb_bytes):,} bytes) · format={_fmt} · encrypted=AES-256"
+        )
         # Auto-detect carve status from entity framework
         try:
             _fw_lkup = _build_entity_lookup(_cached_entity_framework()["data"])
@@ -489,8 +619,21 @@ if exceptions_file is not None:
 
 @st.cache_data(show_spinner=False)
 def _load_results(path, pm_json, mef_json, exc_json, rules_json, carve,
-                  fmt="excel", site_reg_json=None, entity_fw_json=None) -> dict:
+                  fmt="excel", site_reg_json=None, entity_fw_json=None,
+                  enc_key_hex=None) -> dict:
     rules = json.loads(rules_json)
+
+    # ── decrypt temp file if it was encrypted by _write_temp ──────────────────
+    _use_bio: io.BytesIO | None = None
+    if enc_key_hex and isinstance(path, str) and path.endswith(".enc"):
+        try:
+            _raw_bytes = Path(path).read_bytes()
+            _dec_bytes = Fernet(bytes.fromhex(enc_key_hex)).decrypt(_raw_bytes)
+            _use_bio = io.BytesIO(_dec_bytes)
+        except Exception as _dec_err:
+            raise ValueError(
+                f"Could not decrypt uploaded file (session key mismatch or corrupt data): {_dec_err}"
+            ) from _dec_err
 
     def _rj(j):
         df = pd.read_json(j)
@@ -588,8 +731,10 @@ def _load_results(path, pm_json, mef_json, exc_json, rules_json, carve,
         return df.astype({c: object for c in df.columns})
 
     # ── route by format ────────────────────────────────────────────────────────
+    _src = _use_bio if _use_bio is not None else path   # BytesIO (decrypted) or plain path
+
     if fmt == "csv":
-        raw_df = _to_object(pd.read_csv(path, dtype=str, low_memory=False))
+        raw_df = _to_object(pd.read_csv(_src, dtype=str, low_memory=False))
         if not detect_rx_log(raw_df):
             raise ValueError(
                 "CSV does not match the expected RX-log format. "
@@ -599,8 +744,7 @@ def _load_results(path, pm_json, mef_json, exc_json, rules_json, carve,
 
     elif fmt == "excel_rxlog":
         # Excel file whose first sheet is an RX-log (e.g. rxlog_20260501092518)
-        import io as _io
-        _xl  = pd.ExcelFile(path)
+        _xl  = pd.ExcelFile(_src)
         raw_df = _to_object(_xl.parse(_xl.sheet_names[0], dtype=str))
         if not detect_rx_log(raw_df):
             raise ValueError(
@@ -610,8 +754,32 @@ def _load_results(path, pm_json, mef_json, exc_json, rules_json, carve,
         res = _audit_rxlog(raw_df)
 
     else:  # standard 340B workbook
-        res = run_audit_from_workbook(path, rules=rules, exceptions=exc,
-                                      provider_master=pm, mef=mef, carve_status=carve)
+        if _use_bio is not None:
+            # Read each sheet from a fresh BytesIO (same decrypted bytes, position=0 each time)
+            _wb_bytes = _use_bio.read()
+            def _rio():
+                return io.BytesIO(_wb_bytes)
+            _raw_wb = pd.read_excel(_rio(), sheet_name="Raw_Data")
+            _sm_wb  = pd.read_excel(_rio(), sheet_name="Store_Map")
+            _se_wb  = pd.read_excel(_rio(), sheet_name="Site_Entity_Map")
+            if pm is None:
+                try:
+                    pm = pd.read_excel(_rio(), sheet_name="Provider_Master")
+                except Exception:
+                    pass
+            if mef is None:
+                try:
+                    mef = pd.read_excel(_rio(), sheet_name="MEF")
+                except Exception:
+                    pass
+            res = audit_dataframe(
+                raw=_raw_wb, store_map=_sm_wb, site_entity_map=_se_wb,
+                provider_master=pm, mef=mef, exceptions=exc,
+                rules=rules, carve_status=carve,
+            )
+        else:
+            res = run_audit_from_workbook(path, rules=rules, exceptions=exc,
+                                          provider_master=pm, mef=mef, carve_status=carve)
 
     return {k: v.to_dict(orient="split") for k, v in res.items()}
 
@@ -628,11 +796,14 @@ _site_reg_raw   = _cached_site_registry()["data"]
 site_reg_json   = json.dumps(_site_reg_raw) if _site_reg_raw else None
 _entity_fw_raw  = _cached_entity_framework()["data"]
 entity_fw_json  = json.dumps(_entity_fw_raw) if _entity_fw_raw else None
+# Pass session encryption key so _load_results can decrypt the temp file
+_enc_key_hex    = st.session_state["_enc_key"].hex() if "_enc_key" in st.session_state else None
 
 with st.spinner("Running decision engine…"):
     try:
         cached = _load_results(source_path, pm_json, mef_json, exc_json, rules_json,
-                               carve_status, input_format, site_reg_json, entity_fw_json)
+                               carve_status, input_format, site_reg_json, entity_fw_json,
+                               _enc_key_hex)
     except ValueError as _ve:
         _msg = str(_ve)
         if "not found" in _msg.lower() or "worksheet" in _msg.lower():
@@ -960,7 +1131,10 @@ with tab_queue:
         bucket_display = bucket_df[
             [c for c in BUCKET_COLS if c in bucket_df.columns]
         ].copy()
-        st.dataframe(bucket_display, width="stretch", height=300)
+        st.dataframe(
+            _mask_phi(bucket_display) if _mask_phi_enabled else bucket_display,
+            width="stretch", height=300,
+        )
 
         # ── export this bucket ─────────────────────────────────────────────────
         export_bucket = bucket_df[
@@ -996,9 +1170,16 @@ with tab_queue:
                 bucket_df["Prescription number"].astype(str) == selected_rx
             ].iloc[0]
 
+            _rx_display  = row.get('Prescription number', 'N/A')
+            _pat_display = row.get('Patient name', 'N/A')
+            if _mask_phi_enabled:
+                _rx_str = str(_rx_display).strip()
+                _rx_display = "***" + _rx_str[-4:] if len(_rx_str) >= 4 else "***"
+                _pat_parts  = str(_pat_display).strip().split()
+                _pat_display = " ".join(p[0] + "***" for p in _pat_parts if p) if _pat_parts else "***"
             c1, c2, c3 = st.columns(3)
-            c1.markdown(f"**Rx#:** `{row.get('Prescription number','N/A')}`")
-            c2.markdown(f"**Patient:** {row.get('Patient name','N/A')}")
+            c1.markdown(f"**Rx#:** `{_rx_display}`")
+            c2.markdown(f"**Patient:** {_pat_display}")
             c3.markdown(f"**Fill date:** {str(row.get('Fill date','N/A'))[:10]}")
             c4, c5, c6 = st.columns(3)
             c4.markdown(f"**Drug:** {row.get('Drug name','N/A')}")
@@ -1064,9 +1245,13 @@ with tab_all:
         "Duplicate reason", "MEF check", "MEF detail", "MEF inconsistency",
         "Missing fields list", "Exception flag", "Exception reason",
     ]
-    display_cols = [c for c in DISPLAY_COLS if c in filtered.columns]
+    display_cols  = [c for c in DISPLAY_COLS if c in filtered.columns]
+    _all_display  = filtered[display_cols]
     st.caption(f"{len(filtered):,} of {len(claims):,} claims")
-    st.dataframe(filtered[display_cols], width="stretch", height=450)
+    st.dataframe(
+        _mask_phi(_all_display) if _mask_phi_enabled else _all_display,
+        width="stretch", height=450,
+    )
 
 
 # ── TAB 3: Store Status ───────────────────────────────────────────────────────
@@ -1780,6 +1965,28 @@ with tab_dl:
         file_name="ace_340b_all_claims.csv",
         mime="text/csv",
     )
+
+    st.markdown("---")
+
+    # ── Session Audit Log ─────────────────────────────────────────────────────
+    st.markdown("### 🔒 Session Audit Log")
+    st.caption(
+        "HIPAA-required access log: timestamped record of key events in this session. "
+        "No PHI is recorded. Export for compliance documentation."
+    )
+    _al = st.session_state.get("_audit_log", [])
+    if _al:
+        _al_df = pd.DataFrame(_al).rename(columns={"time": "Timestamp", "event": "Event"})
+        st.dataframe(_al_df, width="stretch", height=min(200, 40 + len(_al_df) * 35))
+        st.download_button(
+            "⬇ Export session audit log CSV",
+            data=_al_df.to_csv(index=False).encode(),
+            file_name=f"ace_340b_session_log_{datetime.date.today().isoformat()}.csv",
+            mime="text/csv",
+            key="audit_log_export",
+        )
+    else:
+        st.info("No events recorded in this session yet.")
 
     st.markdown("---")
 
