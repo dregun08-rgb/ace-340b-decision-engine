@@ -343,16 +343,26 @@ st.sidebar.download_button(
     file_name="exceptions_template.csv",
     mime="text/csv",
 )
-ehr_file = st.sidebar.file_uploader(
-    "EHR encounter data (.xlsx or .csv) — optional",
-    type=["xlsx", "xls", "csv"],
-    help=(
-        "Upload your EHR visit/encounter export to cross-reference 340B claims. "
-        "The engine auto-detects common column names for: encounter date, provider, "
-        "patient, location, drug, NDC, diagnosis, and Rx number. "
-        "See the 🩺 EHR Encounters tab for column mapping and match results."
-    ),
-)
+_EHR_SLOTS = 5
+with st.sidebar.expander(
+    "🩺 EHR Encounter Data (up to 5 datasets)",
+    expanded=any(st.session_state.get(f"_ehr_raw_json_{i}") for i in range(1, _EHR_SLOTS + 1)),
+):
+    st.caption(
+        "Upload one export per EHR system. All datasets are combined for cross-referencing. "
+        "Accepts .xlsx, .xls, or .csv."
+    )
+    _ehr_file_slots: list = []
+    for _si in range(1, _EHR_SLOTS + 1):
+        _lbl = f"EHR Dataset {_si}" + (" (optional)" if _si > 1 else "")
+        _ehr_file_slots.append(
+            st.file_uploader(
+                _lbl,
+                type=["xlsx", "xls", "csv"],
+                key=f"ehr_upload_{_si}",
+                help=f"EHR export #{_si} — encounter date, provider, patient, location, drug, NDC, Rx.",
+            )
+        )
 
 st.sidebar.markdown("---")
 
@@ -632,48 +642,67 @@ if exceptions_file is not None:
     exceptions_df = pd.read_csv(exceptions_file)
     st.sidebar.success(f"Exceptions: {len(exceptions_df):,} records")
 
-# ── EHR data loading ──────────────────────────────────────────────────────────
-ehr_df_raw: pd.DataFrame | None = None
-ehr_df_norm: pd.DataFrame | None = None
-_ehr_col_map: dict = {}
+# ── EHR data loading (up to 5 datasets) ──────────────────────────────────────
+# _ehr_datasets: list of {idx, name, raw, norm, col_map} for each loaded slot
+_ehr_datasets: list[dict] = []
 
-if ehr_file is not None:
-    _ehr_fid = ehr_file.file_id
-    if st.session_state.get("_ehr_file_id") != _ehr_fid:
-        # New upload — read and store raw bytes in session_state
-        _ehr_bytes = ehr_file.getbuffer().tobytes()
-        st.session_state["_ehr_file_id"]   = _ehr_fid
-        st.session_state["_ehr_file_name"] = ehr_file.name
-        st.session_state["_ehr_raw_json"]  = None
-        try:
-            _ehr_name = ehr_file.name.lower()
-            if _ehr_name.endswith((".xlsx", ".xls")):
-                _ehr_raw = pd.read_excel(io.BytesIO(_ehr_bytes), dtype=str)
-            else:
-                _ehr_raw = pd.read_csv(io.BytesIO(_ehr_bytes), dtype=str)
-            st.session_state["_ehr_raw_json"] = _ehr_raw.to_json(orient="split")
-            _audit_log(
-                f"EHR file uploaded: {ehr_file.name} "
-                f"({len(_ehr_raw):,} rows, {len(_ehr_raw.columns)} columns)"
-            )
-        except Exception as _ehr_e:
-            st.sidebar.warning(f"Could not read EHR file: {_ehr_e}")
+for _si, _ehr_file in enumerate(_ehr_file_slots, start=1):
+    _fid_key  = f"_ehr_file_id_{_si}"
+    _name_key = f"_ehr_file_name_{_si}"
+    _json_key = f"_ehr_raw_json_{_si}"
 
-    _ehr_json = st.session_state.get("_ehr_raw_json")
+    if _ehr_file is not None:
+        _ehr_fid = _ehr_file.file_id
+        if st.session_state.get(_fid_key) != _ehr_fid:
+            # New or replaced file — read and cache
+            _ehr_bytes = _ehr_file.getbuffer().tobytes()
+            st.session_state[_fid_key]  = _ehr_fid
+            st.session_state[_name_key] = _ehr_file.name
+            st.session_state[_json_key] = None
+            try:
+                _ehr_fname = _ehr_file.name.lower()
+                if _ehr_fname.endswith((".xlsx", ".xls")):
+                    _ehr_raw_df = pd.read_excel(io.BytesIO(_ehr_bytes), dtype=str)
+                else:
+                    _ehr_raw_df = pd.read_csv(io.BytesIO(_ehr_bytes), dtype=str)
+                st.session_state[_json_key] = _ehr_raw_df.to_json(orient="split")
+                _audit_log(
+                    f"EHR Dataset {_si} uploaded: {_ehr_file.name} "
+                    f"({len(_ehr_raw_df):,} rows, {len(_ehr_raw_df.columns)} columns)"
+                )
+            except Exception as _ehr_e:
+                st.sidebar.warning(f"EHR Dataset {_si}: could not read file — {_ehr_e}")
+
+    # Load from cache (whether just uploaded or from a previous run)
+    _ehr_json = st.session_state.get(_json_key)
     if _ehr_json:
-        ehr_df_raw = pd.DataFrame(**pd.read_json(_ehr_json, orient="split"))
-        # Apply any user-override column mapping stored in session_state
-        _ehr_override = st.session_state.get("_ehr_col_override", {})
-        ehr_df_norm, _ehr_col_map = normalize_ehr(ehr_df_raw, override_map=_ehr_override)
-        _enc_cnt = (
-            ehr_df_norm[EHR_CANONICAL["encounter_date"]].notna().sum()
-            if EHR_CANONICAL["encounter_date"] in ehr_df_norm.columns else 0
-        )
-        st.sidebar.success(
-            f"🩺 EHR loaded: {len(ehr_df_raw):,} rows · "
-            f"{_enc_cnt:,} dated encounters · "
-            f"{sum(1 for v in _ehr_col_map.values() if v)} / {len(_ehr_col_map)} fields detected"
-        )
+        _raw = pd.DataFrame(**pd.read_json(_ehr_json, orient="split"))
+        _override = st.session_state.get(f"_ehr_col_override_{_si}", {})
+        _norm, _col_map = normalize_ehr(_raw, override_map=_override)
+        _ehr_datasets.append({
+            "idx":     _si,
+            "name":    st.session_state.get(_name_key, f"Dataset {_si}"),
+            "raw":     _raw,
+            "norm":    _norm,
+            "col_map": _col_map,
+        })
+
+# Combined normalized EHR (union of all loaded datasets)
+_ehr_combined_norm: pd.DataFrame | None = None
+if _ehr_datasets:
+    _ehr_combined_norm = pd.concat(
+        [d["norm"] for d in _ehr_datasets], ignore_index=True
+    )
+    _total_ehr_rows = len(_ehr_combined_norm)
+    _total_enc = (
+        _ehr_combined_norm[EHR_CANONICAL["encounter_date"]].notna().sum()
+        if EHR_CANONICAL["encounter_date"] in _ehr_combined_norm.columns else 0
+    )
+    # Sidebar summary shown inside the expander would cause state issues; show as caption
+    st.sidebar.caption(
+        f"🩺 {len(_ehr_datasets)} EHR dataset(s) loaded · "
+        f"{_total_ehr_rows:,} rows · {_total_enc:,} dated encounters"
+    )
 
 
 # ── run audit ─────────────────────────────────────────────────────────────────
@@ -1924,17 +1953,16 @@ with tab_entity:
 with tab_ehr:
     st.subheader("EHR Encounter Data")
     st.caption(
-        "Upload your EHR visit/encounter export (Excel or CSV) via the sidebar. "
-        "The engine auto-maps columns for encounter date, provider, patient, location, "
-        "drug, NDC, diagnosis, and Rx number, then cross-references encounters against "
-        "your 340B claims to validate encounter dates and identify missing documentation."
+        "Upload up to 5 EHR exports via the sidebar — one per EHR system or location. "
+        "The engine auto-maps columns for each dataset, then combines them for a single "
+        "cross-reference against all 340B claims."
     )
 
-    if ehr_df_raw is None:
+    if not _ehr_datasets:
         st.info(
-            "No EHR file loaded. Upload an Excel or CSV EHR export using the "
-            "**EHR encounter data** uploader in the sidebar.\n\n"
-            "**Common EHR column names the engine recognises:**\n"
+            "No EHR datasets loaded. Use the **🩺 EHR Encounter Data** expander in the sidebar "
+            "to upload up to 5 Excel or CSV EHR exports.\n\n"
+            "**Common column names the engine recognises:**\n"
             "- **Encounter date**: `Visit Date`, `Date of Service`, `DOS`, `Encounter Date`\n"
             "- **Provider**: `Provider Name`, `Prescriber`, `Attending Provider`, `Physician`\n"
             "- **Provider NPI**: `NPI`, `Provider NPI`, `DR NPI`\n"
@@ -1948,201 +1976,230 @@ with tab_ehr:
             "- **Rx number**: `Rx Number`, `Prescription Number`, `RXNBR`"
         )
     else:
-        # ── column mapping panel ───────────────────────────────────────────────
-        st.markdown("### Column Mapping")
-        st.caption(
-            "Fields auto-detected from your EHR file. "
-            "Correct any mis-mapped field using the dropdowns — changes apply immediately."
-        )
+        # ── per-dataset column mapping & preview ───────────────────────────────
+        st.markdown(f"### {len(_ehr_datasets)} EHR Dataset(s) Loaded")
 
-        _ehr_all_cols = ["— not mapped —"] + list(ehr_df_raw.columns)
-        _ehr_override_new: dict[str, str | None] = {}
-        _current_override = st.session_state.get("_ehr_col_override", {})
-
-        _map_cols = st.columns(3)
-        _canonical_items = list(EHR_CANONICAL.items())  # (key, display_label)
-        for _idx, (_key, _label) in enumerate(_canonical_items):
-            _auto_detected = _ehr_col_map.get(_key)
-            _override_val  = _current_override.get(_key)
-            _current_val   = _override_val or _auto_detected
-            _selected_idx  = (
-                _ehr_all_cols.index(_current_val)
-                if _current_val in _ehr_all_cols
-                else 0
+        for _ds in _ehr_datasets:
+            _ds_idx     = _ds["idx"]
+            _ds_name    = _ds["name"]
+            _ds_raw     = _ds["raw"]
+            _ds_norm    = _ds["norm"]
+            _ds_col_map = _ds["col_map"]
+            _ds_n_det   = sum(1 for v in _ds_col_map.values() if v)
+            _ds_n_tot   = len(_ds_col_map)
+            _ds_enc_col = EHR_CANONICAL["encounter_date"]
+            _ds_enc_cnt = (
+                _ds_norm[_ds_enc_col].notna().sum()
+                if _ds_enc_col in _ds_norm.columns else 0
             )
-            _col_widget = _map_cols[_idx % 3]
-            _detected_label = f" (auto: {_auto_detected})" if _auto_detected else " ⚠️ not detected"
-            _chosen = _col_widget.selectbox(
-                f"**{_label}**{_detected_label}",
-                options=_ehr_all_cols,
-                index=_selected_idx,
-                key=f"ehr_map_{_key}",
-            )
-            _ehr_override_new[_key] = None if _chosen == "— not mapped —" else _chosen
 
-        # Save override if changed
-        if _ehr_override_new != _current_override:
-            st.session_state["_ehr_col_override"] = _ehr_override_new
-            ehr_df_norm, _ehr_col_map = normalize_ehr(ehr_df_raw, override_map=_ehr_override_new)
+            with st.expander(
+                f"📋 Dataset {_ds_idx}: {_ds_name}  —  "
+                f"{len(_ds_raw):,} rows · {_ds_enc_cnt:,} dated encounters · "
+                f"{_ds_n_det}/{_ds_n_tot} fields mapped",
+                expanded=(_ds_n_det < _ds_n_tot),   # auto-expand if mapping is incomplete
+            ):
+                # Column mapping grid
+                st.markdown("**Column mapping** — correct any mis-detected field:")
+                _ds_all_cols       = ["— not mapped —"] + list(_ds_raw.columns)
+                _ds_override_key   = f"_ehr_col_override_{_ds_idx}"
+                _ds_cur_override   = st.session_state.get(_ds_override_key, {})
+                _ds_override_new: dict[str, str | None] = {}
 
-        # Detection summary badges
-        _n_detected = sum(1 for v in _ehr_col_map.values() if v)
-        _n_total    = len(_ehr_col_map)
-        st.markdown(
-            f"<div style='background:#e8f5e9;border:1px solid #a5d6a7;border-radius:8px;"
-            f"padding:10px 16px;margin:8px 0'>"
-            f"<span style='font-size:1.3em;font-weight:800;color:#2e7d32'>{_n_detected}</span>"
-            f"<span style='color:#388e3c;margin-left:6px'>of {_n_total} fields mapped</span>"
-            f"{'&nbsp;&nbsp;✅ All key fields detected' if _n_detected == _n_total else ''}"
-            f"</div>",
-            unsafe_allow_html=True,
+                _mp_cols = st.columns(3)
+                for _fi, (_fkey, _flabel) in enumerate(EHR_CANONICAL.items()):
+                    _auto   = _ds_col_map.get(_fkey)
+                    _cur    = _ds_cur_override.get(_fkey) or _auto
+                    _sel_i  = _ds_all_cols.index(_cur) if _cur in _ds_all_cols else 0
+                    _hint   = f" (auto: {_auto})" if _auto else " ⚠️ not detected"
+                    _chosen = _mp_cols[_fi % 3].selectbox(
+                        f"{_flabel}{_hint}",
+                        options=_ds_all_cols,
+                        index=_sel_i,
+                        key=f"ehr_map_{_ds_idx}_{_fkey}",
+                    )
+                    _ds_override_new[_fkey] = None if _chosen == "— not mapped —" else _chosen
+
+                if _ds_override_new != _ds_cur_override:
+                    st.session_state[_ds_override_key] = _ds_override_new
+                    _ds["norm"], _ds["col_map"] = normalize_ehr(
+                        _ds_raw, override_map=_ds_override_new
+                    )
+                    _ds_norm    = _ds["norm"]
+                    _ds_col_map = _ds["col_map"]
+
+                # Detection badge
+                _nd = sum(1 for v in _ds_col_map.values() if v)
+                _badge_color = "#27ae60" if _nd == _ds_n_tot else "#e67e22" if _nd >= 6 else "#e74c3c"
+                st.markdown(
+                    f"<div style='background:#f8f9fa;border-left:4px solid {_badge_color};"
+                    f"padding:6px 12px;border-radius:4px;margin:8px 0'>"
+                    f"<strong style='color:{_badge_color}'>{_nd} / {_ds_n_tot} fields mapped</strong>"
+                    f"{'&nbsp; ✅ All fields detected' if _nd == _ds_n_tot else ''}"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+
+                # Dataset preview (mapped cols first)
+                _mapped_cols = [c for c in EHR_DISPLAY_FIELDS if c in _ds_norm.columns]
+                _extra_cols  = [c for c in _ds_norm.columns if c not in _mapped_cols]
+                _show_cols   = _mapped_cols + _extra_cols
+                st.dataframe(
+                    _ds_norm[_show_cols].reset_index(drop=True),
+                    width="stretch", height=300,
+                )
+
+                # Per-dataset stats
+                _sc1, _sc2, _sc3, _sc4 = st.columns(4)
+                _sc1.metric("Rows", f"{len(_ds_norm):,}")
+                _sc2.metric("Dated encounters", f"{int(_ds_enc_cnt):,}")
+                _sc3.metric(
+                    "Unique patients",
+                    f"{_ds_norm[EHR_CANONICAL['patient_name']].nunique():,}"
+                    if EHR_CANONICAL["patient_name"] in _ds_norm.columns else "N/A"
+                )
+                _sc4.metric(
+                    "Unique providers",
+                    f"{_ds_norm[EHR_CANONICAL['provider_name']].nunique():,}"
+                    if EHR_CANONICAL["provider_name"] in _ds_norm.columns else "N/A"
+                )
+
+                st.download_button(
+                    f"⬇ Export Dataset {_ds_idx} mapped CSV",
+                    data=_ds_norm[_show_cols].to_csv(index=False).encode(),
+                    file_name=f"ehr_dataset_{_ds_idx}_{datetime.date.today().isoformat()}.csv",
+                    mime="text/csv",
+                    key=f"ehr_ds_export_{_ds_idx}",
+                )
+
+        # Re-build combined norm after any override changes
+        _ehr_combined_norm = pd.concat(
+            [d["norm"] for d in _ehr_datasets], ignore_index=True
         )
 
         st.markdown("---")
 
-        # ── EHR data preview ───────────────────────────────────────────────────
-        st.markdown("### EHR Data Preview")
-        _ehr_file_name = st.session_state.get("_ehr_file_name", "EHR file")
-        st.caption(
-            f"**{_ehr_file_name}** · {len(ehr_df_norm):,} rows · "
-            f"{len(ehr_df_norm.columns)} columns"
+        # ── Combined stats ─────────────────────────────────────────────────────
+        st.markdown("### Combined EHR Summary")
+        _cb_enc_col = EHR_CANONICAL["encounter_date"]
+        _cb_enc_cnt = (
+            _ehr_combined_norm[_cb_enc_col].notna().sum()
+            if _cb_enc_col in _ehr_combined_norm.columns else 0
         )
-
-        # Filter controls
-        _ehr_fc1, _ehr_fc2, _ehr_fc3 = st.columns(3)
-
-        # Provider filter (if mapped)
-        _ehr_prov_col = EHR_CANONICAL["provider_name"]
-        _ehr_providers = (
-            sorted(ehr_df_norm[_ehr_prov_col].dropna().astype(str).unique().tolist())
-            if _ehr_prov_col in ehr_df_norm.columns else []
-        )
-        _sel_ehr_prov = _ehr_fc1.multiselect(
-            "Provider", _ehr_providers, default=_ehr_providers, key="ehr_prov_filter"
-        ) if _ehr_providers else None
-
-        # Location filter (if mapped)
-        _ehr_loc_col = EHR_CANONICAL["location"]
-        _ehr_locs = (
-            sorted(ehr_df_norm[_ehr_loc_col].dropna().astype(str).unique().tolist())
-            if _ehr_loc_col in ehr_df_norm.columns else []
-        )
-        _sel_ehr_loc = _ehr_fc2.multiselect(
-            "Location / Facility", _ehr_locs, default=_ehr_locs, key="ehr_loc_filter"
-        ) if _ehr_locs else None
-
-        # Date range filter (if encounter date mapped)
-        _ehr_enc_col = EHR_CANONICAL["encounter_date"]
-        _ehr_dates_valid = (
-            ehr_df_norm[_ehr_enc_col].dropna()
-            if _ehr_enc_col in ehr_df_norm.columns else pd.Series(dtype="datetime64[ns]")
-        )
-        _ehr_date_filter = None
-        if not _ehr_dates_valid.empty:
-            _ehr_min = _ehr_dates_valid.min().date()
-            _ehr_max = _ehr_dates_valid.max().date()
-            _ehr_date_range = _ehr_fc3.date_input(
-                "Encounter date range",
-                value=(_ehr_min, _ehr_max),
-                min_value=_ehr_min,
-                max_value=_ehr_max,
-                key="ehr_date_filter",
-            )
-            if isinstance(_ehr_date_range, (list, tuple)) and len(_ehr_date_range) == 2:
-                _ehr_date_filter = _ehr_date_range
-
-        # Apply filters
-        _ehr_filtered = ehr_df_norm.copy()
-        if _sel_ehr_prov is not None and _ehr_prov_col in _ehr_filtered.columns:
-            _ehr_filtered = _ehr_filtered[
-                _ehr_filtered[_ehr_prov_col].astype(str).isin(_sel_ehr_prov)
-            ]
-        if _sel_ehr_loc is not None and _ehr_loc_col in _ehr_filtered.columns:
-            _ehr_filtered = _ehr_filtered[
-                _ehr_filtered[_ehr_loc_col].astype(str).isin(_sel_ehr_loc)
-            ]
-        if _ehr_date_filter and _ehr_enc_col in _ehr_filtered.columns:
-            _d0 = pd.Timestamp(_ehr_date_filter[0])
-            _d1 = pd.Timestamp(_ehr_date_filter[1])
-            _ehr_filtered = _ehr_filtered[
-                _ehr_filtered[_ehr_enc_col].between(_d0, _d1, inclusive="both")
-            ]
-
-        # Show mapped canonical columns first, then remaining columns
-        _ehr_mapped_cols = [
-            c for c in EHR_DISPLAY_FIELDS if c in _ehr_filtered.columns
-        ]
-        _ehr_extra_cols  = [
-            c for c in _ehr_filtered.columns if c not in _ehr_mapped_cols
-        ]
-        _ehr_show_cols   = _ehr_mapped_cols + _ehr_extra_cols
-
-        st.caption(f"Showing {len(_ehr_filtered):,} of {len(ehr_df_norm):,} encounters")
-        st.dataframe(
-            _ehr_filtered[_ehr_show_cols].reset_index(drop=True),
-            width="stretch",
-            height=400,
-        )
-
-        # Quick EHR stats
-        _ehr_s1, _ehr_s2, _ehr_s3, _ehr_s4 = st.columns(4)
-        _ehr_s1.metric("Total encounters", f"{len(ehr_df_norm):,}")
-        _ehr_s2.metric(
+        _cs1, _cs2, _cs3, _cs4, _cs5 = st.columns(5)
+        _cs1.metric("Datasets",         len(_ehr_datasets))
+        _cs2.metric("Total rows",       f"{len(_ehr_combined_norm):,}")
+        _cs3.metric("Dated encounters", f"{int(_cb_enc_cnt):,}")
+        _cs4.metric(
             "Unique patients",
-            f"{ehr_df_norm[EHR_CANONICAL['patient_name']].nunique():,}"
-            if EHR_CANONICAL["patient_name"] in ehr_df_norm.columns else "N/A"
+            f"{_ehr_combined_norm[EHR_CANONICAL['patient_name']].nunique():,}"
+            if EHR_CANONICAL["patient_name"] in _ehr_combined_norm.columns else "N/A"
         )
-        _ehr_s3.metric(
+        _cs5.metric(
             "Unique providers",
-            f"{ehr_df_norm[EHR_CANONICAL['provider_name']].nunique():,}"
-            if EHR_CANONICAL["provider_name"] in ehr_df_norm.columns else "N/A"
-        )
-        _ehr_s4.metric(
-            "Unique locations",
-            f"{ehr_df_norm[EHR_CANONICAL['location']].nunique():,}"
-            if EHR_CANONICAL["location"] in ehr_df_norm.columns else "N/A"
+            f"{_ehr_combined_norm[EHR_CANONICAL['provider_name']].nunique():,}"
+            if EHR_CANONICAL["provider_name"] in _ehr_combined_norm.columns else "N/A"
         )
 
-        # Export EHR preview
+        # Combined EHR date range filter
+        _cb_dates = (
+            _ehr_combined_norm[_cb_enc_col].dropna()
+            if _cb_enc_col in _ehr_combined_norm.columns
+            else pd.Series(dtype="datetime64[ns]")
+        )
+        _cb_prov_col = EHR_CANONICAL["provider_name"]
+        _cb_loc_col  = EHR_CANONICAL["location"]
+
+        _cf1, _cf2, _cf3 = st.columns(3)
+        _cb_provs = (
+            sorted(_ehr_combined_norm[_cb_prov_col].dropna().astype(str).unique().tolist())
+            if _cb_prov_col in _ehr_combined_norm.columns else []
+        )
+        _sel_cb_prov = _cf1.multiselect(
+            "Provider", _cb_provs, default=_cb_provs, key="cb_prov_filter"
+        ) if _cb_provs else None
+
+        _cb_locs = (
+            sorted(_ehr_combined_norm[_cb_loc_col].dropna().astype(str).unique().tolist())
+            if _cb_loc_col in _ehr_combined_norm.columns else []
+        )
+        _sel_cb_loc = _cf2.multiselect(
+            "Location", _cb_locs, default=_cb_locs, key="cb_loc_filter"
+        ) if _cb_locs else None
+
+        _cb_date_filter = None
+        if not _cb_dates.empty:
+            _cb_min = _cb_dates.min().date()
+            _cb_max = _cb_dates.max().date()
+            _cb_dr  = _cf3.date_input(
+                "Encounter date range",
+                value=(_cb_min, _cb_max),
+                min_value=_cb_min,
+                max_value=_cb_max,
+                key="cb_date_filter",
+            )
+            if isinstance(_cb_dr, (list, tuple)) and len(_cb_dr) == 2:
+                _cb_date_filter = _cb_dr
+
+        _cb_filtered = _ehr_combined_norm.copy()
+        if _sel_cb_prov is not None and _cb_prov_col in _cb_filtered.columns:
+            _cb_filtered = _cb_filtered[_cb_filtered[_cb_prov_col].astype(str).isin(_sel_cb_prov)]
+        if _sel_cb_loc is not None and _cb_loc_col in _cb_filtered.columns:
+            _cb_filtered = _cb_filtered[_cb_filtered[_cb_loc_col].astype(str).isin(_sel_cb_loc)]
+        if _cb_date_filter and _cb_enc_col in _cb_filtered.columns:
+            _cb_filtered = _cb_filtered[
+                _cb_filtered[_cb_enc_col].between(
+                    pd.Timestamp(_cb_date_filter[0]),
+                    pd.Timestamp(_cb_date_filter[1]),
+                    inclusive="both",
+                )
+            ]
+
+        _cb_show = [c for c in EHR_DISPLAY_FIELDS if c in _cb_filtered.columns] + \
+                   [c for c in _cb_filtered.columns if c not in EHR_DISPLAY_FIELDS]
+        st.caption(f"Combined view: {len(_cb_filtered):,} of {len(_ehr_combined_norm):,} encounters")
+        st.dataframe(_cb_filtered[_cb_show].reset_index(drop=True), width="stretch", height=350)
+
         st.download_button(
-            "⬇ Export mapped EHR data (CSV)",
-            data=_ehr_filtered[_ehr_show_cols].to_csv(index=False).encode(),
-            file_name=f"ehr_mapped_{datetime.date.today().isoformat()}.csv",
+            "⬇ Export combined EHR data (CSV)",
+            data=_cb_filtered[_cb_show].to_csv(index=False).encode(),
+            file_name=f"ehr_combined_{datetime.date.today().isoformat()}.csv",
             mime="text/csv",
-            key="ehr_preview_export",
+            key="ehr_combined_export",
         )
 
         st.markdown("---")
 
-        # ── Claims cross-reference ─────────────────────────────────────────────
+        # ── Claims cross-reference (combined EHR) ─────────────────────────────
         st.markdown("### Claims Cross-Reference")
         st.caption(
-            "Each 340B claim is matched against the EHR encounter data. "
-            "A **MATCHED** claim has a patient encounter within the audit window "
-            "that supports the prescription. A **NO MATCH** claim may lack required "
-            "encounter documentation — a key 340B audit risk."
+            f"Each 340B claim is matched against all {len(_ehr_datasets)} EHR dataset(s) combined. "
+            "A **MATCHED** claim has a supporting patient encounter within the audit window. "
+            "A **NO MATCH** claim may lack required encounter documentation."
         )
 
         _xref_window = int(load_rules().get("thresholds", {}).get(
             "encounter_date_window_days", 365
         ))
 
-        with st.spinner("Running EHR cross-reference…"):
-            _xref_df = crossref_claims(ehr_df_norm, claims, window_days=_xref_window)
+        with st.spinner(f"Cross-referencing claims against {len(_ehr_datasets)} EHR dataset(s)…"):
+            _xref_df = crossref_claims(
+                _ehr_combined_norm, claims, window_days=_xref_window
+            )
 
-        # ── match statistics ───────────────────────────────────────────────────
+        # Match statistics
         _xr_matched  = int((_xref_df["EHR match"] == "MATCHED").sum())
         _xr_no_match = int(_xref_df["EHR match"].str.startswith("NO MATCH").sum())
-        _xr_na       = int((_xref_df["EHR match"] == "N/A").sum())
+        _xr_na       = int(_xref_df["EHR match"].str.startswith("N/A").sum())
         _xr_total    = len(_xref_df)
         _xr_pct      = _xr_matched / _xr_total * 100 if _xr_total else 0
+        _xr_color    = "#27ae60" if _xr_pct >= 80 else "#e67e22" if _xr_pct >= 50 else "#e74c3c"
 
-        # Summary banner
-        _xr_color = "#27ae60" if _xr_pct >= 80 else "#e67e22" if _xr_pct >= 50 else "#e74c3c"
         st.markdown(
             f"<div style='background:#1a2e4a;border-radius:10px;padding:18px 24px;margin:8px 0'>"
             f"<div style='color:#8daabf;font-size:0.75em;text-transform:uppercase;"
-            f"letter-spacing:1.5px;margin-bottom:6px'>EHR Match Rate</div>"
+            f"letter-spacing:1.5px;margin-bottom:6px'>"
+            f"EHR Match Rate — {len(_ehr_datasets)} dataset(s) combined</div>"
             f"<div style='display:flex;align-items:flex-end;gap:24px;flex-wrap:wrap'>"
             f"<div><span style='font-size:3em;font-weight:800;color:{_xr_color}'>"
             f"{_xr_pct:.1f}%</span></div>"
@@ -2152,23 +2209,21 @@ with tab_ehr:
             f"❌ {_xr_no_match:,} no match &nbsp;·&nbsp; "
             f"⚪ {_xr_na:,} N/A</div>"
             f"<div style='color:#8daabf;font-size:0.78em;margin-top:4px'>"
-            f"Encounter window: ±{_xref_window} days of fill date</div>"
+            f"Window: ±{_xref_window} days · {len(_ehr_combined_norm):,} combined EHR rows</div>"
             f"</div></div></div>",
             unsafe_allow_html=True,
         )
 
-        # ── breakdown by compliance category ──────────────────────────────────
+        # Breakdown by compliance category
         if "Compliance category" in _xref_df.columns:
-            st.markdown("#### EHR match breakdown by compliance category")
+            st.markdown("#### Match breakdown by compliance category")
             _xr_pivot = (
                 _xref_df.groupby(["Compliance category", "EHR match"])
-                .size()
-                .unstack(fill_value=0)
-                .reset_index()
+                .size().unstack(fill_value=0).reset_index()
             )
             st.dataframe(_xr_pivot, width="stretch", height=200)
 
-        # ── Missing Encounter claims with EHR support ─────────────────────────
+        # Missing Encounter callout
         _me_matched = _xref_df[
             (_xref_df.get("Compliance category", pd.Series(dtype=str)) == "Missing Encounter")
             & (_xref_df["EHR match"] == "MATCHED")
@@ -2176,21 +2231,19 @@ with tab_ehr:
         if len(_me_matched) > 0:
             st.success(
                 f"🔍 **{len(_me_matched):,} 'Missing Encounter' claim(s) have a matching EHR encounter.** "
-                f"These claims may be resolvable — attach the EHR encounter record as supporting documentation."
+                "These may be resolvable — attach the EHR encounter record as supporting documentation."
             )
-            _me_xr_cols = [c for c in [
-                "Prescription number", "Fill date", "Patient name",
-                "Prescribing provider", "Store number",
-                "EHR match", "EHR encounter date", "EHR provider",
-                "EHR location", "EHR diagnosis",
+            _me_cols = [c for c in [
+                "Prescription number", "Fill date", "Patient name", "Prescribing provider",
+                "Store number", "EHR match", "EHR encounter date",
+                "EHR provider", "EHR location", "EHR diagnosis",
             ] if c in _me_matched.columns]
             st.dataframe(
-                _mask_phi(_me_matched[_me_xr_cols]) if _mask_phi_enabled else _me_matched[_me_xr_cols],
-                width="stretch",
-                height=250,
+                _mask_phi(_me_matched[_me_cols]) if _mask_phi_enabled else _me_matched[_me_cols],
+                width="stretch", height=250,
             )
 
-        # ── Full cross-reference table ─────────────────────────────────────────
+        # Full cross-reference table
         st.markdown("#### Full cross-reference — all claims")
         _xr_filter = st.radio(
             "Filter by EHR match status",
@@ -2206,7 +2259,7 @@ with tab_ehr:
         elif _xr_filter == "N/A":
             _xref_show = _xref_show[_xref_show["EHR match"].str.startswith("N/A")]
 
-        _xr_display_cols = [c for c in [
+        _xr_disp_cols = [c for c in [
             "Prescription number", "Fill date", "Drug name", "NDC",
             "Patient name", "Prescribing provider", "Provider NPI",
             "Store number", "Compliance category", "Risk score", "Risk tier",
@@ -2215,18 +2268,16 @@ with tab_ehr:
         ] if c in _xref_show.columns]
 
         st.caption(
-            f"{len(_xref_show):,} of {len(_xref_df):,} claims · "
-            f"Match rate in view: "
-            f"{int((_xref_show['EHR match'] == 'MATCHED').sum()):,} / {len(_xref_show):,}"
+            f"{len(_xref_show):,} of {len(_xref_df):,} claims shown · "
+            f"{int((_xref_show['EHR match'] == 'MATCHED').sum()):,} matched in view"
         )
         st.dataframe(
-            _mask_phi(_xref_show[_xr_display_cols]) if _mask_phi_enabled else _xref_show[_xr_display_cols],
-            width="stretch",
-            height=400,
+            _mask_phi(_xref_show[_xr_disp_cols]) if _mask_phi_enabled
+            else _xref_show[_xr_disp_cols],
+            width="stretch", height=400,
         )
 
-        # Export
-        _xr_export_cols = [c for c in [
+        _xr_exp_cols = [c for c in [
             "Prescription number", "Fill date", "Drug name",
             "Patient name", "Prescribing provider", "Provider NPI", "Store number",
             "Compliance category", "Risk score",
@@ -2235,7 +2286,7 @@ with tab_ehr:
         ] if c in _xref_df.columns]
         st.download_button(
             "⬇ Export full cross-reference CSV",
-            data=_xref_df[_xr_export_cols].to_csv(index=False).encode(),
+            data=_xref_df[_xr_exp_cols].to_csv(index=False).encode(),
             file_name=f"ace_340b_ehr_crossref_{datetime.date.today().isoformat()}.csv",
             mime="text/csv",
             key="xref_export",
