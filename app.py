@@ -607,14 +607,48 @@ if provider_master_file is not None:
         if _pm_name.endswith((".xlsx", ".xls")):
             _upload_pm = pd.read_excel(provider_master_file, dtype=str)
         else:
-            _upload_pm = pd.read_csv(provider_master_file)
-        if provider_master_df is not None and not provider_master_df.empty:
-            # Merge session upload on top of registry (union, deduplicated)
-            provider_master_df = (
-                pd.concat([provider_master_df, _upload_pm], ignore_index=True)
-                .drop_duplicates(subset=["NPI"])
-                .reset_index(drop=True)
+            _upload_pm = pd.read_csv(provider_master_file, dtype=str)
+
+        # Auto-detect NPI column under common aliases and normalise to "NPI"
+        _pm_cols_lower = {c.lower().strip(): c for c in _upload_pm.columns}
+        _npi_aliases = [
+            "npi", "provider npi", "physician npi", "prescriber npi",
+            "rendering npi", "ordering npi", "national provider identifier",
+        ]
+        _npi_src = next(
+            (_pm_cols_lower[a] for a in _npi_aliases if a in _pm_cols_lower),
+            None,
+        )
+        if _npi_src and _npi_src != "NPI":
+            _upload_pm = _upload_pm.rename(columns={_npi_src: "NPI"})
+
+        # If file has Provider Last Name + First Name but no NPI, add a combined name
+        _has_npi = "NPI" in _upload_pm.columns
+        _last_col  = _pm_cols_lower.get("provider last name") or _pm_cols_lower.get("last name")
+        _first_col = _pm_cols_lower.get("provider first name") or _pm_cols_lower.get("first name")
+        if not _has_npi and _last_col and _first_col:
+            _upload_pm["Provider name"] = (
+                _upload_pm[_last_col].fillna("").str.strip()
+                + ", "
+                + _upload_pm[_first_col].fillna("").str.strip()
+            ).str.strip(", ")
+            st.sidebar.warning(
+                "Provider master loaded, but no NPI column was found. "
+                "NPI-based checks will be skipped. Add an 'NPI' column for full validation."
             )
+        elif not _has_npi:
+            st.sidebar.warning(
+                "Provider master loaded without an NPI column — "
+                "NPI validation checks will be skipped."
+            )
+
+        if provider_master_df is not None and not provider_master_df.empty:
+            # Merge session upload on top of registry (union, deduplicated on NPI if present)
+            _combined = pd.concat([provider_master_df, _upload_pm], ignore_index=True)
+            if "NPI" in _combined.columns:
+                provider_master_df = _combined.drop_duplicates(subset=["NPI"]).reset_index(drop=True)
+            else:
+                provider_master_df = _combined.reset_index(drop=True)
             st.sidebar.success(
                 f"Provider master: {len(provider_master_df):,} records "
                 f"(registry + {len(_upload_pm):,} from upload)"
@@ -676,7 +710,7 @@ for _si, _ehr_file in enumerate(_ehr_file_slots, start=1):
     # Load from cache (whether just uploaded or from a previous run)
     _ehr_json = st.session_state.get(_json_key)
     if _ehr_json:
-        _raw = pd.DataFrame(**pd.read_json(_ehr_json, orient="split"))
+        _raw = pd.read_json(io.StringIO(_ehr_json), orient="split")
         _override = st.session_state.get(f"_ehr_col_override_{_si}", {})
         _norm, _col_map = normalize_ehr(_raw, override_map=_override)
         _ehr_datasets.append({
@@ -726,7 +760,7 @@ def _load_results(path, pm_json, mef_json, exc_json, rules_json, carve,
             ) from _dec_err
 
     def _rj(j):
-        df = pd.read_json(j)
+        df = pd.read_json(io.StringIO(j))
         return df.astype({c: object for c in df.columns})
 
     pm  = _rj(pm_json)  if pm_json  else None

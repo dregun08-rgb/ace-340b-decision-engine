@@ -59,12 +59,20 @@ _HINTS: dict[str, list[str]] = {
         "service date", "appt date", "appointment date", "visit dt",
         "encounter dt", "svc date", "date of visit", "encounter_date",
         "visit_date", "servicedate", "visitdate",
+        # common EHR export variants
+        "effective date", "effective_date", "rx date", "rxdate",
+        "dispense date", "dispensed date", "fill date", "filldate",
+        "prescription date", "order date", "written date",
+        "date",  # bare "Date" column (low-priority — matched last)
     ],
     "provider_name": [
         "provider name", "provider", "prescriber", "attending provider",
         "ordering provider", "physician", "doctor", "clinician",
         "rendering provider", "prescribing provider", "provider_name",
         "physician name",
+        # bracket-style agent fields common in pharmacy EHRs
+        "prescriber [agent]", "prescriber[agent]", "prescriber agent",
+        "ordering physician", "rendering physician",
     ],
     "provider_npi": [
         "provider npi", "npi", "physician npi", "prescriber npi",
@@ -74,6 +82,7 @@ _HINTS: dict[str, list[str]] = {
     "patient_name": [
         "patient name", "patient", "member name", "beneficiary name",
         "patient_name", "patientname", "member",
+        "resident name", "resident",
     ],
     "patient_mrn": [
         "mrn", "patient id", "patient mrn", "member id", "chart number",
@@ -94,6 +103,8 @@ _HINTS: dict[str, list[str]] = {
         "drug name", "drug", "medication", "medication name",
         "drug description", "item description", "product", "drug_name",
         "med name", "prescribed drug", "dispensed drug",
+        # pharmacy system export names
+        "medication description", "drug/medication", "med description",
     ],
     "ndc": [
         "ndc", "national drug code", "ndc code", "drug code", "ndc11",
