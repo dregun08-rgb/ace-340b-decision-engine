@@ -1,14 +1,21 @@
 """
 ace_340b_audit/ingest.py
 ------------------------
-Adapter for proprietary pharmacy RX-log CSV files.
+Adapters for pharmacy dispensing / EHR prescription export files.
 
-Detects the RX-log column schema and maps it to the engine's canonical
-column names, producing the three DataFrames (raw, store_map, site_entity_map)
-expected by audit_dataframe().
+Two adapters are provided:
 
-Supported source: pharmacy dispensing logs with columns such as
-RXNBR, FILLDATE, DRUG NAME, NDC, RX STOREID, DR NPI, DOCNAMELAST, etc.
+1. RX-log adapter (legacy proprietary format)
+   Detects the strict RX-log column schema and maps it to engine-canonical
+   column names.  Required: RXNBR, FILLDATE, DRUG NAME, NDC, RX STOREID, DR NPI.
+
+2. Generic dispense log adapter (flexible EHR/pharmacy exports)
+   Handles any CSV or Excel export from an EHR or pharmacy system that
+   includes patient, drug, date, and location information under various
+   column name conventions (e.g. "Patient", "Medication", "Effective Date",
+   "Location", "Rendering Provider", "Prescriber [Agent]", etc.).
+   Missing NDC / Prescription number are synthesised so the audit engine
+   can still run; those fields are flagged as incomplete.
 """
 
 from __future__ import annotations
@@ -158,3 +165,29 @@ def map_rx_log(
     })
 
     return raw, store_map, site_entity_map
+
+
+# ── EHR / patient-record detection ───────────────────────────────────────────
+
+# Column keywords that strongly indicate the file is an EHR/patient record
+# export rather than a pharmacy billing RX-log.
+_EHR_INDICATOR_COLS: set[str] = {
+    "patient", "patient name", "mrn", "medical record number", "dob",
+    "date of birth", "rendering provider", "medication", "prescriber",
+    "prescriber [agent]", "effective date", "dispense", "is hospice",
+    "inactivated on", "inactive comments", "encounter date", "visit date",
+    "date of service",
+}
+
+
+def looks_like_ehr(df: pd.DataFrame, threshold: int = 3) -> bool:
+    """
+    Return True if *df* appears to be an EHR patient/encounter export.
+
+    Checks how many of its column names (case-insensitive) overlap with
+    common EHR field keywords.  A match count >= *threshold* is treated
+    as a positive signal.
+    """
+    cols_lower = {c.lower().strip() for c in df.columns}
+    matches = len(cols_lower & _EHR_INDICATOR_COLS)
+    return matches >= threshold

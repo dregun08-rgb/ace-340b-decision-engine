@@ -17,7 +17,7 @@ import streamlit as st
 from cryptography.fernet import Fernet
 
 from ace_340b_audit.engine import run_audit_from_workbook, audit_dataframe
-from ace_340b_audit.ingest import detect_rx_log, map_rx_log
+from ace_340b_audit.ingest import detect_rx_log, map_rx_log, looks_like_ehr
 from ace_340b_audit.rules import DEFAULT_RULES, load_rules, save_rules
 from ace_340b_audit.decisions import (
     CATEGORIES, CATEGORY_COLORS, CATEGORY_DESCRIPTIONS, SEVERITY,
@@ -292,7 +292,9 @@ uploaded_file = st.sidebar.file_uploader(
         "RXNBR, FILLDATE, DRUG NAME, NDC, RX STOREID, DR NPI columns\n"
         "• CSV RX-log (.csv) with the same columns\n"
         "The engine auto-maps RX-log columns and extracts site addresses from "
-        "DOCADD1/DOCCITY/DOCST/DOCZIP."
+        "DOCADD1/DOCCITY/DOCST/DOCZIP.\n\n"
+        "Note: EHR patient/encounter files (e.g. medication lists, visit records) "
+        "should be uploaded in the 🩺 EHR Encounter Data section below, not here."
     ),
 )
 st.sidebar.caption("All files below are optional — the audit runs without them.")
@@ -860,6 +862,13 @@ def _load_results(path, pm_json, mef_json, exc_json, rules_json, carve,
     if fmt == "csv":
         raw_df = _to_object(pd.read_csv(_src, dtype=str, low_memory=False))
         if not detect_rx_log(raw_df):
+            if looks_like_ehr(raw_df):
+                raise ValueError(
+                    "EHR_FILE_DETECTED: This file appears to be an EHR patient/encounter "
+                    "export (columns: " + ", ".join(raw_df.columns[:8].tolist()) + ", ...). "
+                    "Upload it using the EHR Encounter Data section in the sidebar, "
+                    "not the main claims file slot."
+                )
             raise ValueError(
                 "CSV does not match the expected RX-log format. "
                 "Required columns: RXNBR, FILLDATE, DRUG NAME, NDC, RX STOREID, DR NPI."
@@ -871,6 +880,12 @@ def _load_results(path, pm_json, mef_json, exc_json, rules_json, carve,
         _xl  = pd.ExcelFile(_src)
         raw_df = _to_object(_xl.parse(_xl.sheet_names[0], dtype=str))
         if not detect_rx_log(raw_df):
+            if looks_like_ehr(raw_df):
+                raise ValueError(
+                    "EHR_FILE_DETECTED: This file appears to be an EHR patient/encounter "
+                    "export. Upload it using the EHR Encounter Data section in the sidebar, "
+                    "not the main claims file slot."
+                )
             raise ValueError(
                 f"Excel sheet '{_xl.sheet_names[0]}' does not match the RX-log format. "
                 "Required columns: RXNBR, FILLDATE, DRUG NAME, NDC, RX STOREID, DR NPI."
@@ -935,6 +950,15 @@ with st.spinner("Running decision engine…"):
                 "⚠️  **Workbook sheet not found.** Your Excel file must contain sheets named exactly: "
                 "`Raw_Data`, `Store_Map`, `Site_Entity_Map`. "
                 f"Detail: {_msg}"
+            )
+        elif "ehr_file_detected" in _msg.lower():
+            st.warning(
+                "📋  **This looks like an EHR patient/encounter file.**  "
+                "It cannot be used as the main 340B claims file here.\n\n"
+                "**What to do:** Upload this file in the **🩺 EHR Encounter Data** "
+                "section in the left sidebar.  The EHR section will auto-detect the "
+                "column names and let you cross-reference encounters against your "
+                "340B claims."
             )
         elif "rx-log format" in _msg.lower() or "required columns" in _msg.lower():
             st.error(
