@@ -60,10 +60,11 @@ _HINTS: dict[str, list[str]] = {
         "encounter dt", "svc date", "date of visit", "encounter_date",
         "visit_date", "servicedate", "visitdate",
         # common EHR export variants
-        "effective date", "effective_date", "rx date", "rxdate",
+        "date",  # bare "Date" column — common in eCW/EHR medication exports
+        "rx date", "rxdate",
         "dispense date", "dispensed date", "fill date", "filldate",
         "prescription date", "order date", "written date",
-        "date",  # bare "Date" column (low-priority — matched last)
+        "effective date", "effective_date",  # often empty; lower priority
     ],
     "provider_name": [
         "provider name", "provider", "prescriber", "attending provider",
@@ -190,14 +191,16 @@ def normalize_ehr(
 
     out = df.rename(columns=rename).copy()
 
-    # Coerce encounter date to datetime
+    # Coerce encounter date to datetime (strip whitespace-only values first)
     enc_col = CANONICAL["encounter_date"]
     if enc_col in out.columns:
+        out[enc_col] = out[enc_col].replace(r'^\s*$', pd.NA, regex=True)
         out[enc_col] = pd.to_datetime(out[enc_col], errors="coerce")
 
     # Coerce patient DOB
     dob_col = CANONICAL["patient_dob"]
     if dob_col in out.columns:
+        out[dob_col] = out[dob_col].replace(r'^\s*$', pd.NA, regex=True)
         out[dob_col] = pd.to_datetime(out[dob_col], errors="coerce")
 
     return out, mapping
