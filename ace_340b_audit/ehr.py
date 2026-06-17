@@ -193,12 +193,12 @@ def normalize_ehr(
     # Coerce encounter date to datetime
     enc_col = CANONICAL["encounter_date"]
     if enc_col in out.columns:
-        out[enc_col] = pd.to_datetime(out[enc_col], errors="coerce", infer_datetime_format=True)
+        out[enc_col] = pd.to_datetime(out[enc_col], errors="coerce")
 
     # Coerce patient DOB
     dob_col = CANONICAL["patient_dob"]
     if dob_col in out.columns:
-        out[dob_col] = pd.to_datetime(out[dob_col], errors="coerce", infer_datetime_format=True)
+        out[dob_col] = pd.to_datetime(out[dob_col], errors="coerce")
 
     return out, mapping
 
