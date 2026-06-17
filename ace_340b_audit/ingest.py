@@ -37,6 +37,7 @@ _COLUMN_MAP: dict[str, str] = {
     "P3 NAME":  "Tertiary payer",
     # extras preserved for display / filtering
     "MRN":      "MRN",
+    "PATKEY":   "Patient key",
     "RF":       "Refill",
     "DTYPE":    "Drug type",
     "DEACLASS": "DEA class",

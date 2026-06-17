@@ -206,6 +206,58 @@ def normalize_ehr(
     return out, mapping
 
 
+# ── name normalization helpers ────────────────────────────────────────────────
+
+_NAME_SUFFIXES = {
+    "JR", "SR", "II", "III", "IV", "V",
+    "MD", "DO", "NP", "PA", "RN", "APRN", "FNP", "DNP",
+    "PHARMD", "DDS", "DMD", "PHD", "ESQ",
+}
+
+
+def _normalize_name(name: str) -> str:
+    """
+    Normalize a patient name for matching.
+
+    - Uppercase, strip whitespace
+    - Remove suffixes (Jr, Sr, II, III, MD, DO, etc.)
+    - Remove punctuation (periods, commas, apostrophes, hyphens → spaces)
+    - Collapse multiple spaces
+    - Sort tokens alphabetically so "FIRST LAST" == "LAST FIRST"
+
+    Examples
+    --------
+    >>> _normalize_name("Kip Claxton Jr")
+    'CLAXTON KIP'
+    >>> _normalize_name("Claxton, Kip")
+    'CLAXTON KIP'
+    >>> _normalize_name("Cruz-Rodriguez, Leylani")
+    'CRUZ LEYLANI RODRIGUEZ'
+    """
+    if not name or not isinstance(name, str):
+        return ""
+    s = name.upper().strip()
+    # Remove punctuation
+    for ch in ".,'-":
+        s = s.replace(ch, " ")
+    tokens = s.split()
+    # Remove suffixes
+    tokens = [t for t in tokens if t not in _NAME_SUFFIXES]
+    # Sort alphabetically so order doesn't matter
+    tokens.sort()
+    return " ".join(tokens)
+
+
+def _normalize_mrn(val) -> str:
+    """Normalize an MRN value for matching — strip, remove leading zeros."""
+    if pd.isna(val):
+        return ""
+    s = str(val).strip().lstrip("0")
+    # Remove .0 from float conversion
+    s = s.replace(".0", "")
+    return s
+
+
 # ── claims cross-reference ────────────────────────────────────────────────────
 
 def crossref_claims(
@@ -217,30 +269,41 @@ def crossref_claims(
     Cross-reference EHR encounters against 340B claim records.
 
     Match strategy (in priority order):
-      1. Patient name + encounter date within ``window_days`` of fill date
+      1. MRN exact match (most reliable patient identifier)
+      2. MRN match + encounter date within ``window_days`` of fill date
+      3. Patient name (normalized) + encounter date within ``window_days``
          + Provider NPI match (if NPI available in both)
-      2. Patient name + encounter date within ``window_days`` (NPI absent/mismatch)
-      3. Rx number exact match (if Rx number present in EHR)
+      4. Patient name (normalized) + encounter date within ``window_days``
+         (NPI absent/mismatch)
+      5. Rx number exact match (if Rx number present in EHR)
+
+    Name normalization handles:
+      - "Kip Claxton Jr" vs "Claxton, Kip" → both become "CLAXTON KIP"
+      - Suffixes (Jr, Sr, II, III, MD, DO, etc.) are stripped
+      - Hyphens and punctuation are removed
+      - Token order is ignored (FIRST LAST == LAST FIRST)
 
     Returns
     -------
     pd.DataFrame
         claims_df with added columns:
-        - ``EHR match``          : "MATCHED" | "NO MATCH" | "N/A"
+        - ``EHR match``          : "MATCHED" | "MATCHED (MRN)" | "NO MATCH" | "N/A"
         - ``EHR encounter date`` : matched encounter date string (blank if no match)
         - ``EHR provider``       : matched provider name from EHR (blank if no match)
         - ``EHR location``       : matched location from EHR (blank if no match)
         - ``EHR diagnosis``      : matched diagnosis code from EHR (blank if no match)
+        - ``EHR match method``   : which strategy produced the match
     """
     result = claims_df.copy()
     for col in ("EHR match", "EHR encounter date", "EHR provider",
-                "EHR location", "EHR diagnosis"):
+                "EHR location", "EHR diagnosis", "EHR match method"):
         result[col] = ""
     result["EHR match"] = "N/A"
 
     # Column shortcuts
     enc_col  = CANONICAL["encounter_date"]
     pat_col  = CANONICAL["patient_name"]
+    mrn_col  = CANONICAL["patient_mrn"]
     npi_col  = CANONICAL["provider_npi"]
     prov_col = CANONICAL["provider_name"]
     loc_col  = CANONICAL["location"]
@@ -251,18 +314,25 @@ def crossref_claims(
     claim_pat_col = "Patient name"
     claim_npi_col = "Provider NPI"
     claim_rx_col  = "Prescription number"
+    claim_mrn_col = "MRN"               # mapped from PATKEY or MRN in rx log
 
     has_enc  = enc_col in ehr_df.columns
     has_pat  = pat_col in ehr_df.columns
+    has_mrn  = mrn_col in ehr_df.columns
     has_npi  = npi_col in ehr_df.columns
     has_prov = prov_col in ehr_df.columns
     has_loc  = loc_col in ehr_df.columns
     has_dx   = dx_col in ehr_df.columns
     has_rx   = rx_col in ehr_df.columns
 
-    # Need at minimum an encounter date and patient name, OR an Rx number
-    if not ((has_enc and has_pat) or has_rx):
-        result["EHR match"] = "N/A — EHR must contain patient name + encounter date, or Rx number"
+    has_claim_mrn = claim_mrn_col in claims_df.columns
+    # Also check for "Patient key" (PATKEY) as alternate MRN in claims
+    claim_patkey_col = "Patient key"
+    has_claim_patkey = claim_patkey_col in claims_df.columns
+
+    # Need at minimum an encounter date and patient name, an MRN, or an Rx number
+    if not ((has_enc and has_pat) or has_mrn or has_rx):
+        result["EHR match"] = "N/A — EHR must contain patient name + encounter date, MRN, or Rx number"
         return result
 
     if fill_col not in claims_df.columns:
@@ -272,28 +342,43 @@ def crossref_claims(
     # ── preprocess EHR ───────────────────────────────────────────────────────
     ehr = ehr_df.copy()
     if has_pat:
-        ehr["_pat"] = ehr[pat_col].fillna("").astype(str).str.upper().str.strip()
+        ehr["_pat_norm"] = ehr[pat_col].fillna("").astype(str).apply(_normalize_name)
+    if has_mrn:
+        ehr["_mrn"] = ehr[mrn_col].apply(_normalize_mrn)
     if has_enc:
         ehr[enc_col] = pd.to_datetime(ehr[enc_col], errors="coerce")
     if has_rx:
         ehr["_rx"] = ehr[rx_col].fillna("").astype(str).str.strip()
 
-    # Build fast lookup: patient_name → list of EHR row dicts
+    # Build EHR row entry helper
+    def _ehr_entry(row) -> dict[str, Any]:
+        return {
+            "enc_date": getattr(row, enc_col, None) if has_enc else None,
+            "npi":      str(getattr(row, npi_col, "")).strip() if has_npi else "",
+            "provider": str(getattr(row, prov_col, "")).strip() if has_prov else "",
+            "location": str(getattr(row, loc_col, "")).strip() if has_loc else "",
+            "dx":       str(getattr(row, dx_col, "")).strip() if has_dx else "",
+            "pat_name": str(getattr(row, pat_col, "")).strip() if has_pat else "",
+        }
+
+    # Build fast lookup: MRN → list of EHR row dicts
+    _ehr_by_mrn: dict[str, list[dict]] = {}
+    if has_mrn:
+        for row in ehr.itertuples(index=False):
+            mrn_val = getattr(row, "_mrn", "")
+            if not mrn_val:
+                continue
+            _ehr_by_mrn.setdefault(mrn_val, []).append(_ehr_entry(row))
+
+    # Build fast lookup: normalized patient name → list of EHR row dicts
     _ehr_by_pat: dict[str, list[dict]] = {}
     if has_pat and has_enc:
         ehr_valid = ehr.dropna(subset=[enc_col])
         for row in ehr_valid.itertuples(index=False):
-            pat = getattr(row, "_pat", "")
+            pat = getattr(row, "_pat_norm", "")
             if not pat:
                 continue
-            entry: dict[str, Any] = {
-                "enc_date": getattr(row, enc_col, None),
-                "npi":      str(getattr(row, npi_col, "")).strip() if has_npi else "",
-                "provider": str(getattr(row, prov_col, "")).strip() if has_prov else "",
-                "location": str(getattr(row, loc_col, "")).strip() if has_loc else "",
-                "dx":       str(getattr(row, dx_col, "")).strip() if has_dx else "",
-            }
-            _ehr_by_pat.setdefault(pat, []).append(entry)
+            _ehr_by_pat.setdefault(pat, []).append(_ehr_entry(row))
 
     # Build fast lookup: rx_number → EHR row dict (for Rx-based match fallback)
     _ehr_by_rx: dict[str, dict] = {}
@@ -302,47 +387,74 @@ def crossref_claims(
             rxn = getattr(row, "_rx", "")
             if not rxn:
                 continue
-            entry = {
-                "enc_date": str(getattr(row, enc_col, ""))[:10] if has_enc else "",
-                "npi":      str(getattr(row, npi_col, "")).strip() if has_npi else "",
-                "provider": str(getattr(row, prov_col, "")).strip() if has_prov else "",
-                "location": str(getattr(row, loc_col, "")).strip() if has_loc else "",
-                "dx":       str(getattr(row, dx_col, "")).strip() if has_dx else "",
-            }
-            _ehr_by_rx[rxn] = entry
+            _ehr_by_rx[rxn] = _ehr_entry(row)
 
     # ── preprocess claims ────────────────────────────────────────────────────
     result["_fill"] = pd.to_datetime(result[fill_col], errors="coerce")
-    result["_pat"]  = (
-        result[claim_pat_col].fillna("").astype(str).str.upper().str.strip()
+    result["_pat_norm"] = (
+        result[claim_pat_col].fillna("").astype(str).apply(_normalize_name)
         if claim_pat_col in result.columns else ""
     )
-    result["_npi"]  = (
+    result["_npi"] = (
         result[claim_npi_col].fillna("").astype(str).str.strip()
         if claim_npi_col in result.columns else ""
     )
-    result["_rxn"]  = (
+    result["_rxn"] = (
         result[claim_rx_col].fillna("").astype(str).str.strip()
         if claim_rx_col in result.columns else ""
     )
+    # Try MRN from claims (mapped from MRN column or PATKEY)
+    if has_claim_mrn:
+        result["_mrn"] = result[claim_mrn_col].apply(_normalize_mrn)
+    elif has_claim_patkey:
+        result["_mrn"] = result[claim_patkey_col].apply(_normalize_mrn)
+    else:
+        result["_mrn"] = ""
+
+    # ── match helper ─────────────────────────────────────────────────────────
+    def _fill_match(entry: dict, method: str) -> dict:
+        return {
+            "EHR match":          "MATCHED",
+            "EHR encounter date": str(entry.get("enc_date", ""))[:10] if entry.get("enc_date") else "",
+            "EHR provider":       entry.get("provider", ""),
+            "EHR location":       entry.get("location", ""),
+            "EHR diagnosis":      entry.get("dx", ""),
+            "EHR match method":   method,
+        }
 
     # ── match each claim ─────────────────────────────────────────────────────
     def _match_row(row: Any) -> dict:
         out = {"EHR match": "NO MATCH", "EHR encounter date": "",
-               "EHR provider": "", "EHR location": "", "EHR diagnosis": ""}
+               "EHR provider": "", "EHR location": "", "EHR diagnosis": "",
+               "EHR match method": ""}
 
         fill = row["_fill"]
-        pat  = row["_pat"]
+        pat  = row["_pat_norm"]
         npi  = row["_npi"]
         rxn  = row["_rxn"]
+        mrn  = row["_mrn"] if "_mrn" in row.index else ""
 
-        # Strategy 1: patient name + encounter date
+        # ── Strategy 1: MRN match + date window (highest confidence) ──────
+        if mrn and mrn in _ehr_by_mrn:
+            candidates = _ehr_by_mrn[mrn]
+            # If we have a fill date, prefer encounters in the date window
+            if not pd.isna(fill):
+                for c in candidates:
+                    enc = c.get("enc_date")
+                    if enc is not None and not pd.isna(enc):
+                        if abs((enc - fill).days) <= window_days:
+                            return _fill_match(c, "MRN + date window")
+            # MRN match without date window — still high confidence
+            if candidates:
+                return _fill_match(candidates[0], "MRN only")
+
+        # ── Strategy 2: normalized name + encounter date ──────────────────
         if pat and not pd.isna(fill) and pat in _ehr_by_pat:
             candidates = _ehr_by_pat[pat]
             best = None
             best_npi_match = False
             for c in candidates:
-                enc = c["enc_date"]
+                enc = c.get("enc_date")
                 if enc is None or pd.isna(enc):
                     continue
                 if abs((enc - fill).days) <= window_days:
@@ -351,26 +463,20 @@ def crossref_claims(
                         best = c
                         best_npi_match = npi_ok
             if best:
-                out["EHR match"]          = "MATCHED"
-                out["EHR encounter date"] = str(best["enc_date"])[:10]
-                out["EHR provider"]       = best["provider"]
-                out["EHR location"]       = best["location"]
-                out["EHR diagnosis"]      = best["dx"]
-                return out
+                method = "Name + date"
+                if best_npi_match and npi:
+                    method = "Name + date + NPI"
+                return _fill_match(best, method)
 
-        # Strategy 2: Rx number exact match
+        # ── Strategy 3: Rx number exact match ─────────────────────────────
         if rxn and rxn in _ehr_by_rx:
-            best = _ehr_by_rx[rxn]
-            out["EHR match"]          = "MATCHED"
-            out["EHR encounter date"] = best["enc_date"]
-            out["EHR provider"]       = best["provider"]
-            out["EHR location"]       = best["location"]
-            out["EHR diagnosis"]      = best["dx"]
-            return out
+            return _fill_match(_ehr_by_rx[rxn], "Rx number")
 
-        # If patient exists in EHR but no date in window
-        if pat and pat in _ehr_by_pat:
-            out["EHR match"] = "NO MATCH — patient found, no encounter in window"
+        # Provide detail on near-misses
+        if mrn and mrn in _ehr_by_mrn:
+            out["EHR match"] = "NO MATCH — MRN found, no encounter in date window"
+        elif pat and pat in _ehr_by_pat:
+            out["EHR match"] = "NO MATCH — patient found by name, no encounter in window"
         elif pat:
             out["EHR match"] = "NO MATCH — patient not in EHR"
 
