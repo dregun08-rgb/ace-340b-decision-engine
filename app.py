@@ -346,15 +346,15 @@ st.sidebar.download_button(
     mime="text/csv",
 )
 
-# ── Code 20 / Rejected Claims upload ─────────────────────────────────────────
-with st.sidebar.expander("💢 Code 20 — Rejected/Unpaid Claims", expanded=False):
+# ── Code 20 / No Code 20 Report upload ───────────────────────────────────────
+with st.sidebar.expander("💢 Code 20 — Scripts Without 340B Indicator", expanded=False):
     st.caption(
-        "Upload your rejected/unpaid claims report. Scripts missing Code 20 "
-        "(prior auth, plan limitations, billing issues). Supports Southside format "
-        "and generic rejection exports."
+        "Upload the report of scripts that are NOT billed with Code 20. "
+        "Every script in this file is missing the 340B billing indicator "
+        "(NCPDP 436-E1 ≠ 20), meaning it is not being billed at the 340B price."
     )
     code20_file = st.file_uploader(
-        "Code 20 file",
+        "No Code 20 report",
         type=["xlsx", "xls", "csv", "xlsm"],
         key="code20_upload",
         help="Southside format: Rx Nbr, RX DATE, DRUG NAME, DOCTOR, PLANID, PAID, etc.",
@@ -935,7 +935,7 @@ if code20_file is not None:
         _c20_count = len(_code20_df)
         _c20_zero_pay = len(_code20_df[_code20_df.get("PAID", pd.Series()).astype(float) == 0]) if "PAID" in _code20_df.columns else 0
         st.sidebar.caption(
-            f"💢 Code 20 loaded · {_c20_count:,} rejected scripts"
+            f"💢 No Code 20 report loaded · {_c20_count:,} scripts without 340B indicator"
             + (f" · {_c20_zero_pay:,} zero-pay" if _c20_zero_pay else "")
         )
 
@@ -2551,19 +2551,21 @@ with tab_ehr:
         )
 
 
-# ── TAB: Code 20 — 340B Billing Indicator Analysis ──────────────────────────
+# ── TAB: Code 20 — Scripts Missing 340B Billing Indicator ────────────────────
 
 with tab_c20:
-    st.subheader("💢 Code 20 — 340B Billing Indicator Analysis")
+    st.subheader("💢 Code 20 — Scripts Missing 340B Billing Indicator")
     st.markdown("""
     **NCPDP Field 436-E1 (Basis of Cost Determination) = "20"** tells the payer
     that the drug was purchased at the 340B ceiling price.
 
-    - **Code 20 present** → claim is billed as a 340B drug (suppresses Medicaid manufacturer rebate)
-    - **No Code 20** → claim is billed at regular pricing (NOT 340B)
+    **Every script in the uploaded report is missing Code 20** — meaning it is
+    NOT being billed as a 340B drug. This is critical for Medicaid claims because:
 
-    This tab cross-references your Rx Log and rejected/unpaid claims data to identify
-    scripts that should — or should not — carry the 340B billing indicator.
+    - **Medicaid scripts without Code 20** → the state may request a manufacturer rebate,
+      creating a **duplicate discount violation** (prohibited under 340B statute)
+    - **Commercial scripts without Code 20** → may be billed at retail instead of 340B cost,
+      which could be correct depending on your contract carve-in/carve-out status
     """)
 
     if _code20_df is not None and not _code20_df.empty:
@@ -2574,26 +2576,48 @@ with tab_c20:
         c20_total = len(c20)
         c20_zero = len(c20[c20["PAID"].astype(float) == 0]) if "PAID" in c20.columns else 0
         c20_medicaid = len(c20[c20["Plan Group"] == "Medicaid"]) if "Plan Group" in c20.columns else 0
-        c20_commercial = c20_total - c20_medicaid - c20_zero
+        c20_commercial = c20_total - c20_medicaid
 
         k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Total Rejected/Unpaid", f"{c20_total:,}")
+        k1.metric("Scripts Without Code 20", f"{c20_total:,}")
         k2.metric("Zero-Pay Scripts", f"{c20_zero:,}")
-        k3.metric("Medicaid Claims", f"{c20_medicaid:,}")
+        k3.metric("⚠️ Medicaid (Risk)", f"{c20_medicaid:,}")
         k4.metric("Commercial/Other", f"{c20_commercial:,}")
+
+        if c20_medicaid > 0:
+            st.markdown(f"""
+            <div style='background:linear-gradient(135deg, #fef2f2, #fff1f2);
+                 border:1px solid #fca5a5; border-left:4px solid #dc2626;
+                 border-radius:8px; padding:1rem 1.25rem; margin:0.75rem 0'>
+                <div style='color:#991b1b; font-weight:700; font-size:1rem;
+                     margin-bottom:0.35rem'>
+                    🚨 {c20_medicaid:,} Medicaid scripts are NOT billed as 340B
+                </div>
+                <div style='color:#7f1d1d; font-size:0.85rem'>
+                    These Medicaid claims do not have Code 20. If 340B-purchased inventory
+                    was used to fill these scripts, they <strong>must</strong> be resubmitted with
+                    Code 20 (NCPDP 436-E1 = "20") to suppress the manufacturer rebate and
+                    avoid duplicate discount violations. HRSA auditors specifically look for this.
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
 
         st.markdown("---")
 
         # ── Sub-tabs within Code 20 ──
         c20_sub1, c20_sub2, c20_sub3, c20_sub4 = st.tabs([
-            "📋 All Rejected Claims",
-            "🔵 Missing Code 20 (Medicaid)",
+            "📋 All Scripts Missing Code 20",
+            "🚨 Medicaid — Duplicate Discount Risk",
             "📊 Plan Breakdown",
             "🔗 Cross-Reference with Rx Log",
         ])
 
         with c20_sub1:
-            st.markdown("#### All Rejected / Unpaid Claims")
+            st.markdown("#### All Scripts Without Code 20")
+            st.markdown(
+                "Every script below is **not** being billed at the 340B price. "
+                "Review whether 340B-purchased inventory was used — if so, Code 20 must be added."
+            )
             disp_cols = [c for c in [
                 "Rx Nbr", "RX DATE", "DRUG NAME", "Provider", "PLANID",
                 "Plan Category", "Plan Group", "PAID", "QTY", "RF",
@@ -2609,54 +2633,52 @@ with tab_c20:
             st.dataframe(disp_c20, use_container_width=True, height=400)
 
             st.download_button(
-                "⬇ Export Rejected Claims CSV",
+                "⬇ Export All Scripts Missing Code 20 (CSV)",
                 data=c20[disp_cols].to_csv(index=False).encode(),
-                file_name=f"ace_code20_rejected_{datetime.date.today().isoformat()}.csv",
+                file_name=f"ace_no_code20_all_{datetime.date.today().isoformat()}.csv",
                 mime="text/csv",
                 key="c20_export_all",
             )
 
         with c20_sub2:
-            st.markdown("#### 🔵 Medicaid Claims Missing Code 20")
+            st.markdown("#### 🚨 Medicaid Scripts Without Code 20 — Duplicate Discount Risk")
             st.markdown("""
-            These are **Medicaid / Managed Medicaid claims** that were rejected or unpaid.
-            If these scripts were dispensed using 340B-purchased inventory, they **must** carry
-            Code 20 (NCPDP 436-E1 = "20") to properly identify the claim as 340B and suppress
-            the manufacturer rebate request.
+            **These are Medicaid / Managed Medicaid scripts that are NOT billed as 340B.**
 
-            **Without Code 20:**
-            - The state Medicaid agency may request a manufacturer rebate
-            - This creates a **duplicate discount** violation (prohibited under 340B statute)
-            - HRSA auditors specifically look for claims missing Code 20
+            Under the 340B statute, if a covered entity dispenses a drug purchased at the
+            340B ceiling price to a Medicaid patient, the claim **must** carry Code 20 to
+            suppress the manufacturer rebate. Without it:
+
+            - The manufacturer pays a rebate to the state on a drug already purchased at 340B price
+            - This creates a **duplicate discount** — the entity benefits twice
+            - HRSA considers this a serious compliance violation
+            - Can result in removal from the 340B program
+
+            **Action Required:** For each script below, verify whether 340B inventory was used.
+            If yes, resubmit the claim with Code 20.
             """)
 
             if "Plan Group" in c20.columns:
-                medicaid_rejected = c20[c20["Plan Group"] == "Medicaid"].copy()
-                if medicaid_rejected.empty:
-                    st.success("✅ No Medicaid claims in the rejected file.")
+                medicaid_no_code20 = c20[c20["Plan Group"] == "Medicaid"].copy()
+                if medicaid_no_code20.empty:
+                    st.success("✅ No Medicaid claims in the missing Code 20 report.")
                 else:
-                    st.markdown(f"""
-                    <div style='background:linear-gradient(135deg, #fef2f2, #fff1f2);
-                         border:1px solid #fca5a5; border-left:4px solid #dc2626;
-                         border-radius:8px; padding:1rem 1.25rem; margin:0.5rem 0'>
-                        <div style='color:#991b1b; font-weight:700; font-size:0.9rem;
-                             margin-bottom:0.25rem'>
-                            🚨 {len(medicaid_rejected):,} Medicaid claims rejected/unpaid — potential Code 20 issue
-                        </div>
-                        <div style='color:#7f1d1d; font-size:0.85rem'>
-                            These claims may need to be resubmitted with Code 20 to avoid
-                            duplicate discount violations. Review each script to confirm whether
-                            340B-purchased inventory was used.
-                        </div>
-                    </div>
-                    """, unsafe_allow_html=True)
+                    # Sub-metrics for Medicaid
+                    med_zero = len(medicaid_no_code20[medicaid_no_code20["PAID"].astype(float) == 0]) if "PAID" in medicaid_no_code20.columns else 0
+                    med_paid = len(medicaid_no_code20) - med_zero
+                    med_total_paid = pd.to_numeric(medicaid_no_code20.get("PAID", 0), errors="coerce").sum()
+
+                    mm1, mm2, mm3 = st.columns(3)
+                    mm1.metric("Medicaid Scripts (No Code 20)", f"{len(medicaid_no_code20):,}")
+                    mm2.metric("Zero-Pay", f"{med_zero:,}")
+                    mm3.metric("Total Paid Amount", f"${med_total_paid:,.2f}")
 
                     med_disp_cols = [c for c in [
                         "Rx Nbr", "RX DATE", "DRUG NAME", "Provider", "PLANID",
                         "Plan Category", "PAID", "QTY", "PA CODE", "Rejection Type"
-                    ] if c in medicaid_rejected.columns]
+                    ] if c in medicaid_no_code20.columns]
 
-                    med_disp = medicaid_rejected[med_disp_cols].copy()
+                    med_disp = medicaid_no_code20[med_disp_cols].copy()
                     if "RX DATE" in med_disp.columns:
                         med_disp["RX DATE"] = pd.to_datetime(med_disp["RX DATE"], errors="coerce").dt.strftime("%m/%d/%Y").fillna("")
                     if "PAID" in med_disp.columns:
@@ -2665,26 +2687,27 @@ with tab_c20:
                     st.dataframe(med_disp, use_container_width=True, height=400)
 
                     st.download_button(
-                        "⬇ Export Medicaid Missing Code 20 CSV",
-                        data=medicaid_rejected[med_disp_cols].to_csv(index=False).encode(),
-                        file_name=f"ace_medicaid_missing_code20_{datetime.date.today().isoformat()}.csv",
+                        "⬇ Export Medicaid Missing Code 20 (CSV)",
+                        data=medicaid_no_code20[med_disp_cols].to_csv(index=False).encode(),
+                        file_name=f"ace_medicaid_no_code20_{datetime.date.today().isoformat()}.csv",
                         mime="text/csv",
                         key="c20_export_medicaid",
                     )
             else:
-                st.info("Plan Group classification not available — upload a Southside-format rejected claims file.")
+                st.info("Plan Group classification not available — upload a Southside-format file for Medicaid detection.")
 
         with c20_sub3:
-            st.markdown("#### Rejected Claims by Plan")
+            st.markdown("#### Scripts Missing Code 20 by Plan")
+            st.markdown("Breakdown of which insurance plans have scripts not billed as 340B.")
             if "Plan Group" in c20.columns:
                 plan_summary = c20.groupby("Plan Group").agg(
-                    Claims=("Rx Nbr" if "Rx Nbr" in c20.columns else c20.columns[0], "count"),
-                ).reset_index().sort_values("Claims", ascending=False)
+                    Scripts=("Rx Nbr" if "Rx Nbr" in c20.columns else c20.columns[0], "count"),
+                ).reset_index().sort_values("Scripts", ascending=False)
 
-                fig_plan = px.pie(plan_summary, names="Plan Group", values="Claims",
+                fig_plan = px.pie(plan_summary, names="Plan Group", values="Scripts",
                     hole=0.4, color="Plan Group",
                     color_discrete_map={
-                        "Medicaid": "#3b82f6", "BCBS / Anthem": "#f59e0b",
+                        "Medicaid": "#dc2626", "BCBS / Anthem": "#f59e0b",
                         "PBM": "#8b5cf6", "UHC / Optum": "#06b6d4",
                         "Aetna": "#ec4899", "Cigna": "#10b981",
                         "Humana": "#f97316", "Oscar": "#6366f1",
@@ -2698,16 +2721,14 @@ with tab_c20:
                 )
                 st.plotly_chart(fig_plan, use_container_width=True)
 
-                # Detailed plan table
                 if "Plan Category" in c20.columns:
                     plan_detail = c20.groupby(["PLANID", "Plan Category", "Plan Group"]).agg(
-                        Claims=("Rx Nbr" if "Rx Nbr" in c20.columns else c20.columns[0], "count"),
-                    ).reset_index().sort_values("Claims", ascending=False)
+                        Scripts=("Rx Nbr" if "Rx Nbr" in c20.columns else c20.columns[0], "count"),
+                    ).reset_index().sort_values("Scripts", ascending=False)
                     st.dataframe(plan_detail, use_container_width=True, hide_index=True)
 
-                # Rejection type distribution
                 if "Rejection Type" in c20.columns:
-                    st.markdown("#### Rejection Types")
+                    st.markdown("#### Payment Status")
                     rej_summary = c20.groupby("Rejection Type").size().reset_index(name="Count")
                     rej_summary = rej_summary.sort_values("Count", ascending=False)
                     fig_rej = px.bar(rej_summary, x="Rejection Type", y="Count",
@@ -2720,23 +2741,20 @@ with tab_c20:
                 st.info("Upload a Southside-format file for plan breakdown.")
 
         with c20_sub4:
-            st.markdown("#### Cross-Reference: Rejected Claims ↔ Rx Log")
+            st.markdown("#### Cross-Reference: Missing Code 20 ↔ Rx Log")
             st.markdown("""
-            Matches rejected/unpaid claims against the main Rx Log by prescription number
-            to identify whether the rejected script was billed using 340B pricing
-            (via PRICE SCHED) and whether Code 20 should have been applied.
+            Matches scripts missing Code 20 against the main Rx Log by prescription number.
+            This reveals whether the script was filled using 340B pricing (PRICE SCHED = SXC-GAM)
+            in your pharmacy system — if so, Code 20 **should** have been on the claim but wasn't.
             """)
 
-            # Check if we have audit results to cross-reference against
             if audited is not None and not audited.empty:
-                # Match by Rx number
                 c20_rxnbr_col = "Rx Nbr" if "Rx Nbr" in c20.columns else None
 
                 if c20_rxnbr_col:
                     c20_match = c20.copy()
                     c20_match["_rx_clean"] = c20_match[c20_rxnbr_col].fillna("").astype(str).str.strip()
 
-                    # Find matching Rx numbers in the audit data
                     audit_rx_col = "Prescription number" if "Prescription number" in audited.columns else None
                     if audit_rx_col is None and "RXNBR" in audited.columns:
                         audit_rx_col = "RXNBR"
@@ -2745,7 +2763,6 @@ with tab_c20:
                         audit_lookup = audited.copy()
                         audit_lookup["_rx_clean"] = audit_lookup[audit_rx_col].fillna("").astype(str).str.strip()
 
-                        # Get relevant columns from audit
                         audit_keep = ["_rx_clean"]
                         for c in ["Drug name", "DRUG NAME", "Fill date", "FILLDATE",
                                    "Primary payer", "P1 NAME", "PRICE SCHED",
@@ -2759,17 +2776,16 @@ with tab_c20:
                             on="_rx_clean", how="left", suffixes=("", "_rxlog")
                         )
 
-                        # Determine 340B billing status from PRICE SCHED
                         price_sched_col = "PRICE SCHED" if "PRICE SCHED" in merged.columns else None
                         if price_sched_col:
-                            merged["340B Billing (Rx Log)"] = merged[price_sched_col].apply(
-                                lambda x: "Yes — SXC-GAM (Medicaid/340B)"
+                            merged["Was Billed as 340B in Rx Log"] = merged[price_sched_col].apply(
+                                lambda x: "⚠️ YES — SXC-GAM (should have Code 20)"
                                 if str(x).strip().upper() == "SXC-GAM"
                                 else "No — " + str(x) if pd.notna(x) and str(x).strip()
                                 else "Not found in Rx Log"
                             )
                         else:
-                            merged["340B Billing (Rx Log)"] = "PRICE SCHED not available"
+                            merged["Was Billed as 340B in Rx Log"] = "PRICE SCHED not available"
 
                         merged["Found in Rx Log"] = merged.apply(
                             lambda r: "✅ Yes" if any(
@@ -2781,35 +2797,39 @@ with tab_c20:
                         # Summary
                         matched_count = (merged["Found in Rx Log"] == "✅ Yes").sum()
                         unmatched_count = (merged["Found in Rx Log"] == "❌ No").sum()
-                        billed_340b = merged["340B Billing (Rx Log)"].str.contains("SXC-GAM", na=False).sum()
+                        billed_340b = merged["Was Billed as 340B in Rx Log"].str.contains("SXC-GAM", na=False).sum()
 
                         xm1, xm2, xm3 = st.columns(3)
                         xm1.metric("Matched to Rx Log", f"{matched_count:,}")
                         xm2.metric("Not in Rx Log", f"{unmatched_count:,}")
-                        xm3.metric("Billed as 340B (SXC-GAM)", f"{billed_340b:,}")
+                        xm3.metric("⚠️ 340B in Rx Log but No Code 20", f"{billed_340b:,}")
 
                         if billed_340b > 0:
                             st.markdown(f"""
                             <div style='background:linear-gradient(135deg, #fef2f2, #fff1f2);
                                  border:1px solid #fca5a5; border-left:4px solid #dc2626;
                                  border-radius:8px; padding:1rem 1.25rem; margin:0.5rem 0'>
-                                <div style='color:#991b1b; font-weight:700; font-size:0.9rem;
-                                     margin-bottom:0.25rem'>
-                                    ⚠️ {billed_340b:,} rejected scripts were billed under SXC-GAM (340B pricing)
+                                <div style='color:#991b1b; font-weight:700; font-size:1rem;
+                                     margin-bottom:0.35rem'>
+                                    🚨 {billed_340b:,} scripts billed as 340B (SXC-GAM) in the pharmacy system
+                                    but missing Code 20 on the claim
                                 </div>
                                 <div style='color:#7f1d1d; font-size:0.85rem'>
-                                    These scripts used 340B-purchased inventory but were rejected.
-                                    Verify that Code 20 (NCPDP 436-E1) was included on the claim submission.
-                                    Missing Code 20 on Medicaid claims can trigger duplicate discount violations.
+                                    Your Rx Log shows these were filled using 340B pricing (PRICE SCHED = SXC-GAM),
+                                    but they do not have Code 20 on the claim submission. This means the payer
+                                    does not know the drug was purchased at the 340B price. For Medicaid claims,
+                                    this will trigger a manufacturer rebate request — creating a duplicate discount.
+                                    <br><br>
+                                    <strong>Action:</strong> Resubmit these claims with Code 20
+                                    (NCPDP Field 436-E1 = "20").
                                 </div>
                             </div>
                             """, unsafe_allow_html=True)
 
-                        # Display merged table
                         show_cols = [c for c in [
                             c20_rxnbr_col, "RX DATE", "DRUG NAME", "Provider", "PLANID",
-                            "Plan Group", "PAID", "Rejection Type",
-                            "Found in Rx Log", "340B Billing (Rx Log)",
+                            "Plan Group", "PAID",
+                            "Found in Rx Log", "Was Billed as 340B in Rx Log",
                             "Compliance category",
                         ] if c in merged.columns]
 
@@ -2822,27 +2842,29 @@ with tab_c20:
                         st.dataframe(disp_merged, use_container_width=True, height=400)
 
                         st.download_button(
-                            "⬇ Export Code 20 Cross-Reference CSV",
+                            "⬇ Export Cross-Reference (CSV)",
                             data=merged[show_cols].to_csv(index=False).encode(),
-                            file_name=f"ace_code20_xref_{datetime.date.today().isoformat()}.csv",
+                            file_name=f"ace_no_code20_xref_{datetime.date.today().isoformat()}.csv",
                             mime="text/csv",
                             key="c20_xref_export",
                         )
                     else:
                         st.warning("Could not find prescription number column in audit data for cross-reference.")
                 else:
-                    st.warning("Rejected claims file does not contain 'Rx Nbr' column.")
+                    st.warning("Report does not contain 'Rx Nbr' column.")
             else:
-                st.info("Upload both the Rx Log (main upload) and the Code 20 rejected claims file to enable cross-referencing.")
+                st.info("Upload both the Rx Log (main upload) and the No Code 20 report to enable cross-referencing.")
 
     else:
         st.info(
-            "👈 Upload a rejected/unpaid claims file in the sidebar under "
-            "**💢 Code 20 — Rejected/Unpaid Claims** to analyze Code 20 compliance.\n\n"
+            "👈 Upload the **No Code 20 report** in the sidebar under "
+            "**💢 Code 20 — Scripts Without 340B Indicator**.\n\n"
+            "This report contains every script that is **not** being billed with Code 20 "
+            "(NCPDP 436-E1 ≠ 20), meaning they are not identified as 340B to the payer.\n\n"
             "**What to look for:**\n"
-            "- Medicaid claims missing Code 20 → potential duplicate discount violations\n"
-            "- Scripts billed under SXC-GAM (340B) that were rejected → Code 20 may be missing\n"
-            "- Zero-pay claims → verify if Code 20 was submitted correctly"
+            "- **Medicaid scripts without Code 20** → duplicate discount risk if 340B inventory was used\n"
+            "- **Scripts billed as SXC-GAM in the Rx Log but missing Code 20** → confirms Code 20 should be added\n"
+            "- **Zero-pay claims** → may indicate the payer rejected because Code 20 was missing"
         )
 
 
