@@ -129,25 +129,52 @@ elif _inactive_secs > 1200:  # 20-minute warning
     )
 
 # ── HIPAA notice & disclaimer ─────────────────────────────────────────────────
+# ── HIPAA notice (compact) ────────────────────────────────────────────────────
 st.success(
-    "🔒 **HIPAA-Secured Session** — Uploaded files are encrypted at rest using AES-256 (Fernet). "
-    "No PHI is retained between sessions. Session auto-expires after 30 minutes of inactivity. "
-    "Use only under a signed **Business Associate Agreement (BAA)** with ACE 340B.",
-    icon=None,
-)
-st.info(
-    "⚕️  **ACE 340B Decision Engine** — Corrective action guidance is based on HRSA programme "
-    "integrity rules, the Medicaid Exclusion File (MEF) framework, and CMS billing guidance "
-    "(including NDC Qualifier '20'). It is operational in nature and does not constitute legal "
-    "or regulatory advice. Carve-in / carve-out elections may differ by entity and by state. "
-    "Consult your 340B TPA and legal counsel for entity-specific determinations.",
+    "🔒 **HIPAA-Secured** — AES-256 encryption at rest · No PHI retained between sessions · "
+    "30-min auto-expire · Use under signed BAA only.",
     icon=None,
 )
 
-st.title("ACE 340B Decision Engine")
-st.caption("Claim categorisation · Risk scoring · Corrective action plans · Carve-in / Carve-out guidance")
+# ── multi-pharmacy audit selector ────────────────────────────────────────────
+# Each "pharmacy audit" is a named workspace with its own uploaded files.
+# All state is keyed by the pharmacy slug so users can switch between them.
 
-DEFAULT_SAMPLE = Path(__file__).resolve().parent / "MAP_340B_Compliance_Analytics_System_Jan2025.xlsx"
+if "_pharmacies" not in st.session_state:
+    st.session_state["_pharmacies"] = ["Default Audit"]
+    st.session_state["_active_pharmacy"] = "Default Audit"
+
+_pharmacies = st.session_state["_pharmacies"]
+_active = st.session_state.get("_active_pharmacy", _pharmacies[0])
+
+_pharm_col1, _pharm_col2, _pharm_col3 = st.columns([4, 2, 1])
+with _pharm_col1:
+    st.title("ACE 340B Decision Engine")
+with _pharm_col2:
+    _active = st.selectbox(
+        "Active audit",
+        options=_pharmacies,
+        index=_pharmacies.index(_active) if _active in _pharmacies else 0,
+        key="_pharmacy_select",
+        label_visibility="collapsed",
+    )
+    st.session_state["_active_pharmacy"] = _active
+with _pharm_col3:
+    with st.popover("➕ New"):
+        _new_name = st.text_input("Pharmacy name", key="_new_pharm_name", placeholder="e.g. Southside Q2 2026")
+        if st.button("Create", key="_create_pharm") and _new_name.strip():
+            _clean = _new_name.strip()
+            if _clean not in _pharmacies:
+                _pharmacies.append(_clean)
+                st.session_state["_pharmacies"] = _pharmacies
+                st.session_state["_active_pharmacy"] = _clean
+                _audit_log(f"New pharmacy audit created: {_clean}")
+                st.rerun()
+            else:
+                st.warning("Name already exists.")
+
+st.caption(f"📋 **{_active}** — Claim categorisation · Risk scoring · Corrective action plans · Carve-in / Carve-out guidance")
+
 EXCEPTIONS_TEMPLATE_COLS = ["Prescription number", "Exception reason", "Reviewed by", "Review date"]
 CATEGORY_ORDER = [DUPLICATE_DISCOUNT, INELIGIBLE_PRESCRIBER, WRONG_SITE,
                   MISSING_ENCOUNTER, DATA_MISMATCH, COMPLIANT]
@@ -283,69 +310,49 @@ def _addr_keywords(address: str) -> list[str]:
 
 # ── sidebar ───────────────────────────────────────────────────────────────────
 
-st.sidebar.header("Data inputs")
+st.sidebar.markdown(f"### 📋 {_active}")
+st.sidebar.markdown("---")
+
+# ── Primary upload ──
+st.sidebar.markdown("**📂 Primary Data**")
 uploaded_file = st.sidebar.file_uploader(
-    "340B workbook (.xlsx) or RX log (.csv) ✳ Required",
+    "340B workbook or RX log",
     type=["xlsx", "csv"],
-    help=(
-        "• Excel workbook (.xlsx) with sheets: Raw_Data, Store_Map, Site_Entity_Map\n"
-        "• Excel RX-log export (.xlsx) — auto-detected when first sheet contains "
-        "RXNBR, FILLDATE, DRUG NAME, NDC, RX STOREID, DR NPI columns\n"
-        "• CSV RX-log (.csv) with the same columns\n"
-        "The engine auto-maps RX-log columns and extracts site addresses from "
-        "DOCADD1/DOCCITY/DOCST/DOCZIP.\n\n"
-        "Note: EHR patient/encounter files (e.g. medication lists, visit records) "
-        "should be uploaded in the 🩺 EHR Encounter Data section below, not here."
-    ),
+    help="Excel workbook (.xlsx) or RX-log (.csv/.xlsx) with RXNBR, FILLDATE, DRUG NAME, NDC, RX STOREID, DR NPI.",
 )
-st.sidebar.caption("All files below are optional — the audit runs without them.")
 
-# Show registry status in sidebar
-_registry_df = _cached_registry()["df"]
-if _registry_df is not None and not _registry_df.empty:
-    st.sidebar.success(
-        f"👨‍⚕️ Provider registry: {len(_registry_df):,} providers in memory. "
-        "Ineligible Prescriber check is active."
+# ── Optional uploads (collapsed) ──
+with st.sidebar.expander("📎 Supporting Files", expanded=False):
+    # Show registry status
+    _registry_df = _cached_registry()["df"]
+    if _registry_df is not None and not _registry_df.empty:
+        st.caption(f"✅ Provider registry: {len(_registry_df):,} providers")
+
+    provider_master_file = st.file_uploader(
+        "Provider master",
+        type=["csv", "xlsx", "xls"],
+        help="CSV or Excel with 'NPI' column.",
+        key="prov_master_upload",
     )
-else:
-    st.sidebar.info("👨‍⚕️ No provider registry saved. Go to the Provider Registry tab to add your site providers.")
-
-provider_master_file = st.sidebar.file_uploader(
-    "Provider master — one-time upload (optional)",
-    type=["csv", "xlsx", "xls"],
-    help=(
-        "CSV or Excel file with 'NPI' or 'Provider NPI' column for a one-time session upload. "
-        "To persist providers across sessions, use the Provider Registry tab."
-    ),
-)
-mef_file = st.sidebar.file_uploader(
-    "Medicaid Exclusion File — MEF (optional)",
-    type=["csv", "xlsx", "xls"],
-    help=(
-        "HRSA's Medicaid Exclusion File listing covered entities that use 340B drugs "
-        "for Medicaid FFS patients. Optional — audit runs without it, but MEF cross-reference "
-        "and Duplicate Discount MEF flags will show N/A. "
-        "Required columns: '340B ID' and optionally 'State', 'Active'."
-    ),
-)
-st.sidebar.download_button(
-    "⬇ MEF template CSV",
-    data=pd.DataFrame(columns=["340B ID", "Entity Name", "State", "Medicaid Provider NPI", "Active"]).to_csv(index=False).encode(),
-    file_name="mef_template.csv",
-    mime="text/csv",
-    help="Fill with your entity's 340B IDs and Medicaid Provider NPIs from HRSA OPA.",
-)
-exceptions_file = st.sidebar.file_uploader(
-    "Exceptions CSV (optional)",
-    type=["csv"],
-    help="CSV with 'Prescription number' column. Approved claims become EXCEPTION status.",
-)
-st.sidebar.download_button(
-    "⬇ Exceptions template",
-    data=pd.DataFrame(columns=EXCEPTIONS_TEMPLATE_COLS).to_csv(index=False).encode(),
-    file_name="exceptions_template.csv",
-    mime="text/csv",
-)
+    mef_file = st.file_uploader(
+        "Medicaid Exclusion File (MEF)",
+        type=["csv", "xlsx", "xls"],
+        help="HRSA MEF with '340B ID' column.",
+        key="mef_upload",
+    )
+    exceptions_file = st.file_uploader(
+        "Exceptions CSV",
+        type=["csv"],
+        help="CSV with 'Prescription number' column.",
+        key="exc_upload",
+    )
+    _tc1, _tc2 = st.columns(2)
+    _tc1.download_button("MEF template",
+        data=pd.DataFrame(columns=["340B ID", "Entity Name", "State", "Medicaid Provider NPI", "Active"]).to_csv(index=False).encode(),
+        file_name="mef_template.csv", mime="text/csv", key="dl_mef_tpl")
+    _tc2.download_button("Exceptions template",
+        data=pd.DataFrame(columns=EXCEPTIONS_TEMPLATE_COLS).to_csv(index=False).encode(),
+        file_name="exceptions_template.csv", mime="text/csv", key="dl_exc_tpl")
 
 # ── Code 20 / Rejected Claims upload ─────────────────────────────────────────
 with st.sidebar.expander("💢 Code 20 — 340B Billing Claims", expanded=False):
@@ -387,15 +394,10 @@ st.sidebar.markdown("---")
 
 # ── HIPAA / security sidebar ───────────────────────────────────────────────────
 _mask_phi_enabled = st.sidebar.checkbox(
-    "🔒 Mask PHI in display",
-    value=False,
-    key="_phi_mask",
-    help=(
-        "Replaces patient names with initials (J*** D***) and truncates Rx numbers "
-        "to last 4 digits. Downloaded CSVs and reports are NOT masked."
-    ),
+    "🔒 Mask PHI in display", value=False, key="_phi_mask",
+    help="Replaces patient names with initials and truncates Rx numbers.",
 )
-with st.sidebar.expander("🔒 HIPAA Security", expanded=False):
+with st.sidebar.expander("🔒 Security & Session", expanded=False):
     if "_enc_key" in st.session_state:
         st.success("🔐 File encryption: ACTIVE (AES-256 Fernet)")
     else:
@@ -610,11 +612,8 @@ if uploaded_file is not None:
                 "All other checks (NPI, NDC, encounter date, duplicate discount) "
                 "run on live claim data."
             )
-elif DEFAULT_SAMPLE.exists():
-    source_path = str(DEFAULT_SAMPLE)
-    st.sidebar.success("Loaded bundled MAP sample workbook")
 else:
-    st.warning("Upload a 340B workbook to begin.")
+    st.info("👆 Upload a 340B workbook or RX log in the sidebar to begin your audit.")
     st.stop()
 
 # Build provider_master_df: registry (persisted) + optional session upload, merged
@@ -2960,8 +2959,6 @@ with tab_dl:
     _wb_name = (
         uploaded_file.name
         if uploaded_file is not None
-        else DEFAULT_SAMPLE.name
-        if DEFAULT_SAMPLE.exists()
         else "audit_workbook"
     )
 
