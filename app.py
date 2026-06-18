@@ -345,6 +345,20 @@ st.sidebar.download_button(
     file_name="exceptions_template.csv",
     mime="text/csv",
 )
+
+# ── Code 20 / Rejected Claims upload ─────────────────────────────────────────
+with st.sidebar.expander("💢 Code 20 — Rejected/Unpaid Claims", expanded=False):
+    st.caption(
+        "Upload your rejected/unpaid claims report. Scripts missing Code 20 "
+        "(prior auth, plan limitations, billing issues). Supports Southside format "
+        "and generic rejection exports."
+    )
+    code20_file = st.file_uploader(
+        "Code 20 file",
+        type=["xlsx", "xls", "csv", "xlsm"],
+        key="code20_upload",
+        help="Southside format: Rx Nbr, RX DATE, DRUG NAME, DOCTOR, PLANID, PAID, etc.",
+    )
 _EHR_SLOTS = 5
 with st.sidebar.expander(
     "🩺 EHR Encounter Data (up to 5 datasets)",
@@ -739,6 +753,191 @@ if _ehr_datasets:
         f"🩺 {len(_ehr_datasets)} EHR dataset(s) loaded · "
         f"{_total_ehr_rows:,} rows · {_total_enc:,} dated encounters"
     )
+
+
+# ── Code 20 processing ──────────────────────────────────────────────────────
+
+_CODE20_PLANID_MAP = {
+    # Medicaid / Managed Medicaid
+    "AMERI":      "Managed Medicaid — Amerigroup",
+    "AMERIGRO":   "Managed Medicaid — Amerigroup",
+    "MEDICAID":   "Medicaid",
+    # Commercial — BCBS
+    "ANT/BCBS":   "Commercial — Anthem BCBS",
+    "BCBS/G":     "Commercial — BCBS of Georgia",
+    "BCBS":       "Commercial — BCBS",
+    "BCBS/ILL":   "Commercial — BCBS Illinois",
+    "BCBS/NJ":    "Commercial — BCBS New Jersey",
+    "BCBSMR":     "Commercial — BCBS (MR)",
+    "BGH-FEP":    "Commercial — BCBS Federal Employee",
+    "BCBO":       "Commercial — BCBS (Other)",
+    "BCTX":       "Commercial — BCBS Texas",
+    "ANT":        "Commercial — Anthem",
+    "ANT-D":      "Commercial — Anthem (D)",
+    # Commercial — CVS/Caremark
+    "CVS/CARE":   "PBM — CVS Caremark",
+    "CAREMARK":   "PBM — Caremark",
+    "CARMARK":    "PBM — Caremark",
+    "CAREMKS":    "PBM — Caremark",
+    "CareM":      "PBM — Caremark",
+    "CARE":       "PBM — Caremark",
+    # Commercial — Cigna
+    "CIG-GWH":    "Commercial — Cigna",
+    "CIGEXP":     "Commercial — Cigna Express",
+    "CIG-D":      "Commercial — Cigna (D)",
+    # Commercial — Aetna
+    "AETNA":      "Commercial — Aetna",
+    "AETNA-D":    "Commercial — Aetna (D)",
+    # Commercial — Humana
+    "HUMANA-D":   "Commercial — Humana",
+    # Commercial — UHC/Optum
+    "UHC":        "Commercial — UnitedHealthcare",
+    "UNITED":     "Commercial — United",
+    "OPTUMRX":    "PBM — OptumRx",
+    "OPTUMMD":    "PBM — OptumRx (MD)",
+    "UNI-D":      "Commercial — United (D)",
+    "UMR":        "Commercial — UMR",
+    "UMR/2":      "Commercial — UMR",
+    # Commercial — Oscar
+    "OSC25":      "Commercial — Oscar Health",
+    # Commercial — Medco/Express
+    "MEDCO":      "PBM — Medco",
+    "MEDCO-D":    "PBM — Medco (D)",
+    "CMK-D":      "PBM — Caremark (D)",
+    # Commercial — Other
+    "5PLAN":      "Commercial — 5 Plan",
+    "RXS-D":      "PBM — Rx Savings",
+    "PRO/C":      "Commercial — ProCare",
+    "SMITHRX":    "PBM — SmithRx",
+    "RXADV":      "PBM — Rx Advantage",
+    "MAXOR3":     "PBM — Maxor",
+    "MAGRX":      "PBM — MagRx",
+    "USRX":       "PBM — USRX",
+    "CORESLAB":   "PBM — CoreSlab",
+    # Cash / Sliding Scale
+    "SFS-E":      "Sliding Fee Scale — Cash",
+    "SFE-CPAY":   "Sliding Fee — Copay",
+    "SFC-CPAY":   "Sliding Fee — Copay",
+    "OTC":        "Cash — Over the Counter",
+    # Discount
+    "DIS/CARD":   "Discount Card",
+    "DIS/COU":    "Discount Coupon",
+    "GIL/PAP":    "Patient Assistance Program",
+    # Pre-pack / Internal
+    "PREPACK":    "Pre-Pack (Internal)",
+    "FRIDAYS":    "Internal — Fridays",
+    "MCK-LOY":    "PBM — McKesson Loyalty",
+    "anthemrx":   "Commercial — AnthemRx",
+}
+
+
+def _classify_planid(planid: str) -> str:
+    """Classify a PLANID into a billing category."""
+    if pd.isna(planid) or not str(planid).strip():
+        return "Unknown"
+    p = str(planid).strip()
+    mapped = _CODE20_PLANID_MAP.get(p)
+    if mapped:
+        return mapped
+    # Numeric plan IDs are typically Medicaid
+    if p.isdigit():
+        return "Medicaid / State Plan"
+    return f"Other — {p}"
+
+
+def _classify_planid_group(planid: str) -> str:
+    """High-level group for PLANID (for charts)."""
+    full = _classify_planid(planid)
+    if "Medicaid" in full:
+        return "Medicaid"
+    elif "BCBS" in full or "Anthem" in full:
+        return "BCBS / Anthem"
+    elif "PBM" in full:
+        return "PBM"
+    elif "Humana" in full:
+        return "Humana"
+    elif "Aetna" in full:
+        return "Aetna"
+    elif "Cigna" in full:
+        return "Cigna"
+    elif "UHC" in full or "United" in full or "Optum" in full or "UMR" in full:
+        return "UHC / Optum"
+    elif "Oscar" in full:
+        return "Oscar"
+    elif "Cash" in full or "Sliding" in full or "Discount" in full or "OTC" in full:
+        return "Cash / Discount"
+    elif "Commercial" in full:
+        return "Commercial — Other"
+    elif "Patient Assistance" in full:
+        return "PAP"
+    else:
+        return "Other"
+
+
+@st.cache_data
+def _load_code20(file) -> pd.DataFrame:
+    """Load a Code 20 / rejected claims file (Southside format or generic)."""
+    fname = file.name.lower()
+    file.seek(0)
+    if fname.endswith(".csv"):
+        df = pd.read_csv(file, dtype=str)
+    else:
+        df = pd.read_excel(file, dtype=str)
+
+    df.columns = df.columns.str.strip()
+
+    # Detect Southside format (Rx Nbr, RX DATE, PLANID, etc.)
+    southside_cols = {"Rx Nbr", "RX DATE", "DRUG NAME", "PLANID", "PAID"}
+    is_southside = southside_cols.issubset(set(df.columns))
+
+    if is_southside:
+        # Normalize Southside format
+        df["RX DATE"] = pd.to_datetime(df["RX DATE"], errors="coerce")
+        df["PAID"] = pd.to_numeric(df["PAID"], errors="coerce").fillna(0)
+        df["QTY"] = pd.to_numeric(df.get("QTY", 0), errors="coerce").fillna(0)
+        df["RF"] = pd.to_numeric(df.get("RF", 0), errors="coerce").fillna(0)
+        df["PA CODE"] = df.get("PA CODE", "").astype(str).replace("nan", "")
+        df["DAW"] = pd.to_numeric(df.get("DAW", 0), errors="coerce").fillna(0)
+
+        # Combine doctor name
+        doc_first = df.get("DOCTOR FIRST NAME", pd.Series([""] * len(df))).fillna("").astype(str).str.strip()
+        doc_last = df.get("DOCTOR LAST NAME", pd.Series([""] * len(df))).fillna("").astype(str).str.strip()
+        df["Provider"] = (doc_first + " " + doc_last).str.strip()
+
+        # Classify plan
+        df["Plan Category"] = df["PLANID"].apply(_classify_planid)
+        df["Plan Group"] = df["PLANID"].apply(_classify_planid_group)
+
+        # Flag type of rejection
+        df["Rejection Type"] = df.apply(lambda r: (
+            "Zero Pay" if float(r["PAID"]) == 0
+            else "Underpaid" if float(r["PAID"]) < 1
+            else "Negative" if float(r["PAID"]) < 0
+            else "Low Reimbursement"
+        ), axis=1)
+
+        df["_format"] = "southside"
+    else:
+        # Generic format — try to map common column names
+        df["_format"] = "generic"
+        df["Plan Group"] = "Unknown"
+        df["Plan Category"] = "Unknown"
+        df["Rejection Type"] = "Unknown"
+        df["Provider"] = ""
+
+    return df
+
+
+_code20_df: pd.DataFrame | None = None
+if code20_file is not None:
+    _code20_df = _load_code20(code20_file)
+    if _code20_df is not None and not _code20_df.empty:
+        _c20_count = len(_code20_df)
+        _c20_zero_pay = len(_code20_df[_code20_df.get("PAID", pd.Series()).astype(float) == 0]) if "PAID" in _code20_df.columns else 0
+        st.sidebar.caption(
+            f"💢 Code 20 loaded · {_c20_count:,} rejected scripts"
+            + (f" · {_c20_zero_pay:,} zero-pay" if _c20_zero_pay else "")
+        )
 
 
 # ── run audit ─────────────────────────────────────────────────────────────────
@@ -1158,7 +1357,7 @@ st.markdown("---")
 # TABS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-tab_queue, tab_all, tab_store, tab_exc, tab_prov, tab_entity, tab_ehr, tab_dl = st.tabs([
+tab_queue, tab_all, tab_store, tab_exc, tab_prov, tab_entity, tab_ehr, tab_c20, tab_dl = st.tabs([
     "⚠️ Review Queue",
     "📄 All Claims",
     "🏪 Store Status",
@@ -1166,6 +1365,7 @@ tab_queue, tab_all, tab_store, tab_exc, tab_prov, tab_entity, tab_ehr, tab_dl = 
     "👨‍⚕️ Provider Registry",
     "🏢 Entity Frameworks",
     "🩺 EHR Encounters",
+    "💢 Code 20",
     "⬇ Downloads",
 ])
 
@@ -2348,6 +2548,301 @@ with tab_ehr:
             file_name=f"ace_340b_ehr_crossref_{datetime.date.today().isoformat()}.csv",
             mime="text/csv",
             key="xref_export",
+        )
+
+
+# ── TAB: Code 20 — 340B Billing Indicator Analysis ──────────────────────────
+
+with tab_c20:
+    st.subheader("💢 Code 20 — 340B Billing Indicator Analysis")
+    st.markdown("""
+    **NCPDP Field 436-E1 (Basis of Cost Determination) = "20"** tells the payer
+    that the drug was purchased at the 340B ceiling price.
+
+    - **Code 20 present** → claim is billed as a 340B drug (suppresses Medicaid manufacturer rebate)
+    - **No Code 20** → claim is billed at regular pricing (NOT 340B)
+
+    This tab cross-references your Rx Log and rejected/unpaid claims data to identify
+    scripts that should — or should not — carry the 340B billing indicator.
+    """)
+
+    if _code20_df is not None and not _code20_df.empty:
+        c20 = _code20_df.copy()
+        st.markdown("---")
+
+        # ── KPIs ──
+        c20_total = len(c20)
+        c20_zero = len(c20[c20["PAID"].astype(float) == 0]) if "PAID" in c20.columns else 0
+        c20_medicaid = len(c20[c20["Plan Group"] == "Medicaid"]) if "Plan Group" in c20.columns else 0
+        c20_commercial = c20_total - c20_medicaid - c20_zero
+
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Total Rejected/Unpaid", f"{c20_total:,}")
+        k2.metric("Zero-Pay Scripts", f"{c20_zero:,}")
+        k3.metric("Medicaid Claims", f"{c20_medicaid:,}")
+        k4.metric("Commercial/Other", f"{c20_commercial:,}")
+
+        st.markdown("---")
+
+        # ── Sub-tabs within Code 20 ──
+        c20_sub1, c20_sub2, c20_sub3, c20_sub4 = st.tabs([
+            "📋 All Rejected Claims",
+            "🔵 Missing Code 20 (Medicaid)",
+            "📊 Plan Breakdown",
+            "🔗 Cross-Reference with Rx Log",
+        ])
+
+        with c20_sub1:
+            st.markdown("#### All Rejected / Unpaid Claims")
+            disp_cols = [c for c in [
+                "Rx Nbr", "RX DATE", "DRUG NAME", "Provider", "PLANID",
+                "Plan Category", "Plan Group", "PAID", "QTY", "RF",
+                "PA CODE", "DAW", "Rejection Type", "_format"
+            ] if c in c20.columns]
+
+            disp_c20 = c20[disp_cols].copy()
+            if "RX DATE" in disp_c20.columns:
+                disp_c20["RX DATE"] = pd.to_datetime(disp_c20["RX DATE"], errors="coerce").dt.strftime("%m/%d/%Y").fillna("")
+            if "PAID" in disp_c20.columns:
+                disp_c20["PAID"] = pd.to_numeric(disp_c20["PAID"], errors="coerce").apply(lambda x: f"${x:,.2f}" if pd.notna(x) else "")
+
+            st.dataframe(disp_c20, use_container_width=True, height=400)
+
+            st.download_button(
+                "⬇ Export Rejected Claims CSV",
+                data=c20[disp_cols].to_csv(index=False).encode(),
+                file_name=f"ace_code20_rejected_{datetime.date.today().isoformat()}.csv",
+                mime="text/csv",
+                key="c20_export_all",
+            )
+
+        with c20_sub2:
+            st.markdown("#### 🔵 Medicaid Claims Missing Code 20")
+            st.markdown("""
+            These are **Medicaid / Managed Medicaid claims** that were rejected or unpaid.
+            If these scripts were dispensed using 340B-purchased inventory, they **must** carry
+            Code 20 (NCPDP 436-E1 = "20") to properly identify the claim as 340B and suppress
+            the manufacturer rebate request.
+
+            **Without Code 20:**
+            - The state Medicaid agency may request a manufacturer rebate
+            - This creates a **duplicate discount** violation (prohibited under 340B statute)
+            - HRSA auditors specifically look for claims missing Code 20
+            """)
+
+            if "Plan Group" in c20.columns:
+                medicaid_rejected = c20[c20["Plan Group"] == "Medicaid"].copy()
+                if medicaid_rejected.empty:
+                    st.success("✅ No Medicaid claims in the rejected file.")
+                else:
+                    st.markdown(f"""
+                    <div style='background:linear-gradient(135deg, #fef2f2, #fff1f2);
+                         border:1px solid #fca5a5; border-left:4px solid #dc2626;
+                         border-radius:8px; padding:1rem 1.25rem; margin:0.5rem 0'>
+                        <div style='color:#991b1b; font-weight:700; font-size:0.9rem;
+                             margin-bottom:0.25rem'>
+                            🚨 {len(medicaid_rejected):,} Medicaid claims rejected/unpaid — potential Code 20 issue
+                        </div>
+                        <div style='color:#7f1d1d; font-size:0.85rem'>
+                            These claims may need to be resubmitted with Code 20 to avoid
+                            duplicate discount violations. Review each script to confirm whether
+                            340B-purchased inventory was used.
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                    med_disp_cols = [c for c in [
+                        "Rx Nbr", "RX DATE", "DRUG NAME", "Provider", "PLANID",
+                        "Plan Category", "PAID", "QTY", "PA CODE", "Rejection Type"
+                    ] if c in medicaid_rejected.columns]
+
+                    med_disp = medicaid_rejected[med_disp_cols].copy()
+                    if "RX DATE" in med_disp.columns:
+                        med_disp["RX DATE"] = pd.to_datetime(med_disp["RX DATE"], errors="coerce").dt.strftime("%m/%d/%Y").fillna("")
+                    if "PAID" in med_disp.columns:
+                        med_disp["PAID"] = pd.to_numeric(med_disp["PAID"], errors="coerce").apply(lambda x: f"${x:,.2f}" if pd.notna(x) else "")
+
+                    st.dataframe(med_disp, use_container_width=True, height=400)
+
+                    st.download_button(
+                        "⬇ Export Medicaid Missing Code 20 CSV",
+                        data=medicaid_rejected[med_disp_cols].to_csv(index=False).encode(),
+                        file_name=f"ace_medicaid_missing_code20_{datetime.date.today().isoformat()}.csv",
+                        mime="text/csv",
+                        key="c20_export_medicaid",
+                    )
+            else:
+                st.info("Plan Group classification not available — upload a Southside-format rejected claims file.")
+
+        with c20_sub3:
+            st.markdown("#### Rejected Claims by Plan")
+            if "Plan Group" in c20.columns:
+                plan_summary = c20.groupby("Plan Group").agg(
+                    Claims=("Rx Nbr" if "Rx Nbr" in c20.columns else c20.columns[0], "count"),
+                ).reset_index().sort_values("Claims", ascending=False)
+
+                fig_plan = px.pie(plan_summary, names="Plan Group", values="Claims",
+                    hole=0.4, color="Plan Group",
+                    color_discrete_map={
+                        "Medicaid": "#3b82f6", "BCBS / Anthem": "#f59e0b",
+                        "PBM": "#8b5cf6", "UHC / Optum": "#06b6d4",
+                        "Aetna": "#ec4899", "Cigna": "#10b981",
+                        "Humana": "#f97316", "Oscar": "#6366f1",
+                        "Cash / Discount": "#84cc16", "Commercial — Other": "#94a3b8",
+                        "PAP": "#14b8a6", "Other": "#64748b",
+                    })
+                fig_plan.update_layout(
+                    font=dict(family="DM Sans"),
+                    margin=dict(t=20, b=20, l=20, r=20),
+                    legend=dict(orientation="h", y=-0.2),
+                )
+                st.plotly_chart(fig_plan, use_container_width=True)
+
+                # Detailed plan table
+                if "Plan Category" in c20.columns:
+                    plan_detail = c20.groupby(["PLANID", "Plan Category", "Plan Group"]).agg(
+                        Claims=("Rx Nbr" if "Rx Nbr" in c20.columns else c20.columns[0], "count"),
+                    ).reset_index().sort_values("Claims", ascending=False)
+                    st.dataframe(plan_detail, use_container_width=True, hide_index=True)
+
+                # Rejection type distribution
+                if "Rejection Type" in c20.columns:
+                    st.markdown("#### Rejection Types")
+                    rej_summary = c20.groupby("Rejection Type").size().reset_index(name="Count")
+                    rej_summary = rej_summary.sort_values("Count", ascending=False)
+                    fig_rej = px.bar(rej_summary, x="Rejection Type", y="Count",
+                        color="Rejection Type",
+                        color_discrete_sequence=px.colors.qualitative.Set2)
+                    fig_rej.update_layout(showlegend=False, font=dict(family="DM Sans"),
+                        margin=dict(t=20, b=30))
+                    st.plotly_chart(fig_rej, use_container_width=True)
+            else:
+                st.info("Upload a Southside-format file for plan breakdown.")
+
+        with c20_sub4:
+            st.markdown("#### Cross-Reference: Rejected Claims ↔ Rx Log")
+            st.markdown("""
+            Matches rejected/unpaid claims against the main Rx Log by prescription number
+            to identify whether the rejected script was billed using 340B pricing
+            (via PRICE SCHED) and whether Code 20 should have been applied.
+            """)
+
+            # Check if we have audit results to cross-reference against
+            if audited is not None and not audited.empty:
+                # Match by Rx number
+                c20_rxnbr_col = "Rx Nbr" if "Rx Nbr" in c20.columns else None
+
+                if c20_rxnbr_col:
+                    c20_match = c20.copy()
+                    c20_match["_rx_clean"] = c20_match[c20_rxnbr_col].fillna("").astype(str).str.strip()
+
+                    # Find matching Rx numbers in the audit data
+                    audit_rx_col = "Prescription number" if "Prescription number" in audited.columns else None
+                    if audit_rx_col is None and "RXNBR" in audited.columns:
+                        audit_rx_col = "RXNBR"
+
+                    if audit_rx_col:
+                        audit_lookup = audited.copy()
+                        audit_lookup["_rx_clean"] = audit_lookup[audit_rx_col].fillna("").astype(str).str.strip()
+
+                        # Get relevant columns from audit
+                        audit_keep = ["_rx_clean"]
+                        for c in ["Drug name", "DRUG NAME", "Fill date", "FILLDATE",
+                                   "Primary payer", "P1 NAME", "PRICE SCHED",
+                                   "Patient name", "Prescribing provider",
+                                   "Compliance category"]:
+                            if c in audit_lookup.columns:
+                                audit_keep.append(c)
+
+                        merged = c20_match.merge(
+                            audit_lookup[audit_keep].drop_duplicates(subset=["_rx_clean"]),
+                            on="_rx_clean", how="left", suffixes=("", "_rxlog")
+                        )
+
+                        # Determine 340B billing status from PRICE SCHED
+                        price_sched_col = "PRICE SCHED" if "PRICE SCHED" in merged.columns else None
+                        if price_sched_col:
+                            merged["340B Billing (Rx Log)"] = merged[price_sched_col].apply(
+                                lambda x: "Yes — SXC-GAM (Medicaid/340B)"
+                                if str(x).strip().upper() == "SXC-GAM"
+                                else "No — " + str(x) if pd.notna(x) and str(x).strip()
+                                else "Not found in Rx Log"
+                            )
+                        else:
+                            merged["340B Billing (Rx Log)"] = "PRICE SCHED not available"
+
+                        merged["Found in Rx Log"] = merged.apply(
+                            lambda r: "✅ Yes" if any(
+                                pd.notna(r.get(c)) and str(r.get(c)).strip()
+                                for c in ["Drug name", "DRUG NAME"]
+                            ) else "❌ No", axis=1
+                        )
+
+                        # Summary
+                        matched_count = (merged["Found in Rx Log"] == "✅ Yes").sum()
+                        unmatched_count = (merged["Found in Rx Log"] == "❌ No").sum()
+                        billed_340b = merged["340B Billing (Rx Log)"].str.contains("SXC-GAM", na=False).sum()
+
+                        xm1, xm2, xm3 = st.columns(3)
+                        xm1.metric("Matched to Rx Log", f"{matched_count:,}")
+                        xm2.metric("Not in Rx Log", f"{unmatched_count:,}")
+                        xm3.metric("Billed as 340B (SXC-GAM)", f"{billed_340b:,}")
+
+                        if billed_340b > 0:
+                            st.markdown(f"""
+                            <div style='background:linear-gradient(135deg, #fef2f2, #fff1f2);
+                                 border:1px solid #fca5a5; border-left:4px solid #dc2626;
+                                 border-radius:8px; padding:1rem 1.25rem; margin:0.5rem 0'>
+                                <div style='color:#991b1b; font-weight:700; font-size:0.9rem;
+                                     margin-bottom:0.25rem'>
+                                    ⚠️ {billed_340b:,} rejected scripts were billed under SXC-GAM (340B pricing)
+                                </div>
+                                <div style='color:#7f1d1d; font-size:0.85rem'>
+                                    These scripts used 340B-purchased inventory but were rejected.
+                                    Verify that Code 20 (NCPDP 436-E1) was included on the claim submission.
+                                    Missing Code 20 on Medicaid claims can trigger duplicate discount violations.
+                                </div>
+                            </div>
+                            """, unsafe_allow_html=True)
+
+                        # Display merged table
+                        show_cols = [c for c in [
+                            c20_rxnbr_col, "RX DATE", "DRUG NAME", "Provider", "PLANID",
+                            "Plan Group", "PAID", "Rejection Type",
+                            "Found in Rx Log", "340B Billing (Rx Log)",
+                            "Compliance category",
+                        ] if c in merged.columns]
+
+                        disp_merged = merged[show_cols].copy()
+                        if "RX DATE" in disp_merged.columns:
+                            disp_merged["RX DATE"] = pd.to_datetime(disp_merged["RX DATE"], errors="coerce").dt.strftime("%m/%d/%Y").fillna("")
+                        if "PAID" in disp_merged.columns:
+                            disp_merged["PAID"] = pd.to_numeric(disp_merged["PAID"], errors="coerce").apply(lambda x: f"${x:,.2f}" if pd.notna(x) else "")
+
+                        st.dataframe(disp_merged, use_container_width=True, height=400)
+
+                        st.download_button(
+                            "⬇ Export Code 20 Cross-Reference CSV",
+                            data=merged[show_cols].to_csv(index=False).encode(),
+                            file_name=f"ace_code20_xref_{datetime.date.today().isoformat()}.csv",
+                            mime="text/csv",
+                            key="c20_xref_export",
+                        )
+                    else:
+                        st.warning("Could not find prescription number column in audit data for cross-reference.")
+                else:
+                    st.warning("Rejected claims file does not contain 'Rx Nbr' column.")
+            else:
+                st.info("Upload both the Rx Log (main upload) and the Code 20 rejected claims file to enable cross-referencing.")
+
+    else:
+        st.info(
+            "👈 Upload a rejected/unpaid claims file in the sidebar under "
+            "**💢 Code 20 — Rejected/Unpaid Claims** to analyze Code 20 compliance.\n\n"
+            "**What to look for:**\n"
+            "- Medicaid claims missing Code 20 → potential duplicate discount violations\n"
+            "- Scripts billed under SXC-GAM (340B) that were rejected → Code 20 may be missing\n"
+            "- Zero-pay claims → verify if Code 20 was submitted correctly"
         )
 
 
