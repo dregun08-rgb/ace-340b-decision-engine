@@ -71,15 +71,21 @@ def map_rx_log(
     raw : pd.DataFrame
         Claim-level data with engine-canonical column names.
     store_map : pd.DataFrame
-        One row per unique store; ``Pharmacy location`` is populated with the
-        physical site address from DOCADD1/DOCCITY/DOCST/DOCZIP.
-        ``340B ID`` / ``Covered entity`` are left blank until registered via
-        the Site Registry tab, at which point the engine's entity check passes.
+        One row per unique store.
     site_entity_map : pd.DataFrame
-        Minimal map with ``Site location`` = store number so the entity join
-        can run; ``340B ID`` / ``Covered entity`` are left blank, which causes
-        ``Entity map`` = REVIEW until the user registers the site.
+        Minimal map with ``Site location`` = store number.
     """
+    # ── Drop unused columns early to save memory ─────────────────────────────
+    # The rx log can have 200+ columns; we only need the ones in _COLUMN_MAP
+    # plus a few extras for provider/patient name and address building.
+    _keep = set(_COLUMN_MAP.keys()) | {
+        "DOCNAMEFIRST", "DOCNAMELAST", "PATNAMEFIRST", "PATNAMELAST",
+        "DOCADD1", "DOCADD2", "DOCCITY", "DOCST", "DOCZIP",
+        "PRICE SCHED", "RXCOST", "RXPRICE", "QTY DSP",
+    }
+    _available = [c for c in df.columns if c in _keep]
+    df = df[_available].copy()
+
     raw = df.rename(columns={k: v for k, v in _COLUMN_MAP.items() if k in df.columns})
 
     # ── Prescribing provider (combine first + last) ───────────────────────────

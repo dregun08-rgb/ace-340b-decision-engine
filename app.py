@@ -362,9 +362,9 @@ with st.sidebar.expander("💢 Code 20 — 340B Billing Claims", expanded=False)
              "OR reports where ALL scripts are missing Code 20. "
              "Southside format: Rx Nbr, RX DATE, DRUG NAME, DOCTOR, PLANID, PAID, etc.",
     )
-_EHR_SLOTS = 5
+_EHR_SLOTS = 2
 with st.sidebar.expander(
-    "🩺 EHR Encounter Data (up to 5 datasets)",
+    "🩺 EHR Encounter Data (up to 2 datasets)",
     expanded=any(st.session_state.get(f"_ehr_raw_json_{i}") for i in range(1, _EHR_SLOTS + 1)),
 ):
     st.caption(
@@ -718,11 +718,26 @@ for _si, _ehr_file in enumerate(_ehr_file_slots, start=1):
                     _ehr_raw_df = pd.read_excel(io.BytesIO(_ehr_bytes), dtype=str)
                 else:
                     _ehr_raw_df = pd.read_csv(io.BytesIO(_ehr_bytes), dtype=str)
+                # ── trim to only columns the EHR normalizer actually uses ──
+                _ehr_keep = {
+                    "Patient", "DOB", "MRN", "Location", "Rendering Provider",
+                    "Medication", "Date", "Effective Date", "Pharmacy", "Payer",
+                    "Schedule", "Status", "Sig", "Quantity", "Refills",
+                    "Prescriber [Agent]", "NPI", "Provider NPI",
+                    "Diagnosis", "Diagnosis Code", "ICD", "ICD-10",
+                    "Inactivated On", "Inactive Comments", "Dispense",
+                    "Is Hospice", "Encounter Date", "Visit Date",
+                }
+                _ehr_available = [c for c in _ehr_raw_df.columns if c.strip() in _ehr_keep or c.strip().lower() in {k.lower() for k in _ehr_keep}]
+                if _ehr_available:
+                    _ehr_raw_df = _ehr_raw_df[_ehr_available]
                 st.session_state[_json_key] = _ehr_raw_df.to_json(orient="split")
                 _audit_log(
                     f"EHR Dataset {_si} uploaded: {_ehr_file.name} "
-                    f"({len(_ehr_raw_df):,} rows, {len(_ehr_raw_df.columns)} columns)"
+                    f"({len(_ehr_raw_df):,} rows, {len(_ehr_available)} columns kept)"
                 )
+                del _ehr_raw_df, _ehr_bytes  # free immediately
+                gc.collect()
             except Exception as _ehr_e:
                 st.sidebar.warning(f"EHR Dataset {_si}: could not read file — {_ehr_e}")
 
