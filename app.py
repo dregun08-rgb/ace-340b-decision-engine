@@ -4,6 +4,7 @@ ACE 340B Decision Engine — Streamlit Dashboard
 from __future__ import annotations
 
 import datetime
+import gc
 import io
 import json
 import os
@@ -346,18 +347,20 @@ st.sidebar.download_button(
     mime="text/csv",
 )
 
-# ── Code 20 / No Code 20 Report upload ───────────────────────────────────────
-with st.sidebar.expander("💢 Code 20 — Scripts Without 340B Indicator", expanded=False):
+# ── Code 20 / Rejected Claims upload ─────────────────────────────────────────
+with st.sidebar.expander("💢 Code 20 — 340B Billing Claims", expanded=False):
     st.caption(
-        "Upload the report of scripts that are NOT billed with Code 20. "
-        "Every script in this file is missing the 340B billing indicator "
-        "(NCPDP 436-E1 ≠ 20), meaning it is not being billed at the 340B price."
+        "Upload your claims report. The engine auto-detects whether the file "
+        "contains a Code 20 column (separating 340B vs non-340B claims) or is "
+        "a report of scripts that are all missing Code 20."
     )
     code20_file = st.file_uploader(
-        "No Code 20 report",
+        "Claims / Code 20 report",
         type=["xlsx", "xls", "csv", "xlsm"],
         key="code20_upload",
-        help="Southside format: Rx Nbr, RX DATE, DRUG NAME, DOCTOR, PLANID, PAID, etc.",
+        help="Accepts reports WITH a Code 20 column (scripts marked 340B vs not) "
+             "OR reports where ALL scripts are missing Code 20. "
+             "Southside format: Rx Nbr, RX DATE, DRUG NAME, DOCTOR, PLANID, PAID, etc.",
     )
 _EHR_SLOTS = 5
 with st.sidebar.expander(
@@ -753,6 +756,7 @@ if _ehr_datasets:
         f"🩺 {len(_ehr_datasets)} EHR dataset(s) loaded · "
         f"{_total_ehr_rows:,} rows · {_total_enc:,} dated encounters"
     )
+    gc.collect()  # free memory after heavy EHR load
 
 
 # ── Code 20 processing ──────────────────────────────────────────────────────
@@ -874,9 +878,20 @@ def _classify_planid_group(planid: str) -> str:
         return "Other"
 
 
-@st.cache_data
+@st.cache_data(max_entries=2)
 def _load_code20(file) -> pd.DataFrame:
-    """Load a Code 20 / rejected claims file (Southside format or generic)."""
+    """Load a Code 20 claims file — auto-detects two formats:
+
+    FORMAT A: "No Code 20 report" — every script in this file is missing Code 20.
+              No Code 20 column exists; all rows are assumed non-340B.
+
+    FORMAT B: "Code 20 report" — file contains a Code 20 / 340B indicator column.
+              Scripts are split into those WITH Code 20 (billed as 340B) and
+              those WITHOUT (not billed as 340B).
+
+    Both formats support Southside layout (Rx Nbr, RX DATE, PLANID, PAID, etc.)
+    or generic column names from other pharmacy systems.
+    """
     fname = file.name.lower()
     file.seek(0)
     if fname.endswith(".csv"):
@@ -886,12 +901,36 @@ def _load_code20(file) -> pd.DataFrame:
 
     df.columns = df.columns.str.strip()
 
-    # Detect Southside format (Rx Nbr, RX DATE, PLANID, etc.)
+    # ── Auto-detect whether file contains a Code 20 / 340B indicator column ──
+    _code20_col = None
+    for candidate in df.columns:
+        cl = candidate.lower().strip()
+        if any(kw in cl for kw in [
+            "code 20", "code20", "340b", "340b indicator",
+            "basis of cost", "436-e1", "436e1", "ncpdp 436",
+            "submission clarification", "scc", "basis cost determination",
+        ]):
+            _code20_col = candidate
+            break
+
+    if _code20_col:
+        df["_report_type"] = "has_code20_column"
+        # Normalize the Code 20 values
+        df["Code 20 Status"] = df[_code20_col].fillna("").astype(str).str.strip().str.upper()
+        # Classify: "20" or "YES" or "Y" or "TRUE" = has Code 20
+        df["Has Code 20"] = df["Code 20 Status"].apply(
+            lambda x: "Yes" if x in ("20", "YES", "Y", "TRUE", "1") else "No"
+        )
+    else:
+        df["_report_type"] = "no_code20_column"
+        df["Code 20 Status"] = "NOT PRESENT"
+        df["Has Code 20"] = "No"
+
+    # ── Detect Southside format (Rx Nbr, RX DATE, PLANID, etc.) ──
     southside_cols = {"Rx Nbr", "RX DATE", "DRUG NAME", "PLANID", "PAID"}
     is_southside = southside_cols.issubset(set(df.columns))
 
     if is_southside:
-        # Normalize Southside format
         df["RX DATE"] = pd.to_datetime(df["RX DATE"], errors="coerce")
         df["PAID"] = pd.to_numeric(df["PAID"], errors="coerce").fillna(0)
         df["QTY"] = pd.to_numeric(df.get("QTY", 0), errors="coerce").fillna(0)
@@ -899,16 +938,13 @@ def _load_code20(file) -> pd.DataFrame:
         df["PA CODE"] = df.get("PA CODE", "").astype(str).replace("nan", "")
         df["DAW"] = pd.to_numeric(df.get("DAW", 0), errors="coerce").fillna(0)
 
-        # Combine doctor name
         doc_first = df.get("DOCTOR FIRST NAME", pd.Series([""] * len(df))).fillna("").astype(str).str.strip()
         doc_last = df.get("DOCTOR LAST NAME", pd.Series([""] * len(df))).fillna("").astype(str).str.strip()
         df["Provider"] = (doc_first + " " + doc_last).str.strip()
 
-        # Classify plan
         df["Plan Category"] = df["PLANID"].apply(_classify_planid)
         df["Plan Group"] = df["PLANID"].apply(_classify_planid_group)
 
-        # Flag type of rejection
         df["Rejection Type"] = df.apply(lambda r: (
             "Zero Pay" if float(r["PAID"]) == 0
             else "Underpaid" if float(r["PAID"]) < 1
@@ -918,12 +954,23 @@ def _load_code20(file) -> pd.DataFrame:
 
         df["_format"] = "southside"
     else:
-        # Generic format — try to map common column names
+        # Generic format — try to detect an Rx number column
+        _rx_col = None
+        for candidate in df.columns:
+            cl = candidate.lower().strip()
+            if any(kw in cl for kw in ["rx nbr", "rx number", "rxnbr", "rx #",
+                                         "prescription", "script"]):
+                _rx_col = candidate
+                break
+        if _rx_col and _rx_col != "Rx Nbr":
+            df = df.rename(columns={_rx_col: "Rx Nbr"})
+
         df["_format"] = "generic"
         df["Plan Group"] = "Unknown"
         df["Plan Category"] = "Unknown"
         df["Rejection Type"] = "Unknown"
-        df["Provider"] = ""
+        if "Provider" not in df.columns:
+            df["Provider"] = ""
 
     return df
 
@@ -933,16 +980,25 @@ if code20_file is not None:
     _code20_df = _load_code20(code20_file)
     if _code20_df is not None and not _code20_df.empty:
         _c20_count = len(_code20_df)
-        _c20_zero_pay = len(_code20_df[_code20_df.get("PAID", pd.Series()).astype(float) == 0]) if "PAID" in _code20_df.columns else 0
-        st.sidebar.caption(
-            f"💢 No Code 20 report loaded · {_c20_count:,} scripts without 340B indicator"
-            + (f" · {_c20_zero_pay:,} zero-pay" if _c20_zero_pay else "")
-        )
+        _c20_has_col = _code20_df["_report_type"].iloc[0] == "has_code20_column"
+        _c20_with = (_code20_df["Has Code 20"] == "Yes").sum() if _c20_has_col else 0
+        _c20_without = (_code20_df["Has Code 20"] == "No").sum()
+        if _c20_has_col:
+            st.sidebar.caption(
+                f"💢 Code 20 report loaded · {_c20_count:,} scripts · "
+                f"{_c20_with:,} with Code 20 · {_c20_without:,} without"
+            )
+        else:
+            _c20_zero_pay = len(_code20_df[_code20_df.get("PAID", pd.Series()).astype(float) == 0]) if "PAID" in _code20_df.columns else 0
+            st.sidebar.caption(
+                f"💢 Report loaded · {_c20_count:,} scripts (all missing Code 20)"
+                + (f" · {_c20_zero_pay:,} zero-pay" if _c20_zero_pay else "")
+            )
 
 
 # ── run audit ─────────────────────────────────────────────────────────────────
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=2)
 def _load_results(path, pm_json, mef_json, exc_json, rules_json, carve,
                   fmt="excel", site_reg_json=None, entity_fw_json=None,
                   enc_key_hex=None) -> dict:
