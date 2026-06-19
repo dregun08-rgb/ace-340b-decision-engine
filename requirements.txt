@@ -5,3 +5,4 @@ numpy>=1.26.0
 python-docx>=1.1.0
 cryptography>=41.0.0
 xlrd>=2.0.0
+plotly>=5.18.0

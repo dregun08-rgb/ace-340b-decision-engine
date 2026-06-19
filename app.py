@@ -14,6 +14,7 @@ import zipfile
 from pathlib import Path
 
 import pandas as pd
+import plotly.express as px
 import streamlit as st
 from cryptography.fernet import Fernet
 
@@ -285,12 +286,14 @@ def _build_entity_lookup(fw: dict) -> dict:
     for eid, edata in fw.items():
         for sid, sdata in edata.get("sites", {}).items():
             lookup[str(sid).strip()] = {
-                "entity_id":    eid,
-                "name":         edata.get("name", ""),
-                "b340_id":      edata.get("340B_ID", ""),
-                "carve_status": edata.get("carve_status", "unknown"),
-                "site_type":    sdata.get("site_type", "340B"),
-                "address":      sdata.get("address", ""),
+                "entity_id":     eid,
+                "name":          edata.get("name", ""),
+                "b340_id":       edata.get("340B_ID", ""),
+                "carve_status":  edata.get("carve_status", "unknown"),
+                "site_type":     sdata.get("site_type", "340B"),
+                "address":       sdata.get("address", ""),
+                "location_name": sdata.get("location_name", ""),
+                "active":        sdata.get("active", True),
             }
     return lookup
 
@@ -2166,19 +2169,40 @@ with tab_entity:
         if _sel_sites:
             st.markdown(f"**{len(_sel_sites)} site(s):**")
             for _site_id, _site_data in list(_sel_sites.items()):
-                _type_badge = (
-                    "<span style='background:#27ae60;color:white;border-radius:10px;"
-                    "padding:2px 8px;font-size:0.75em'>340B</span>"
-                    if _site_data.get("site_type", "340B").upper() == "340B"
-                    else
-                    "<span style='background:#e67e22;color:white;border-radius:10px;"
-                    "padding:2px 8px;font-size:0.75em'>Retail</span>"
-                )
+                _stype = _site_data.get("site_type", "340B").upper()
+                _is_active = _site_data.get("active", True)
+                if "SATELLITE" in _stype:
+                    _type_badge = (
+                        "<span style='background:#2980b9;color:white;border-radius:10px;"
+                        "padding:2px 8px;font-size:0.75em'>340B Satellite</span>"
+                    )
+                elif _stype == "340B":
+                    _type_badge = (
+                        "<span style='background:#27ae60;color:white;border-radius:10px;"
+                        "padding:2px 8px;font-size:0.75em'>340B</span>"
+                    )
+                else:
+                    _type_badge = (
+                        "<span style='background:#e67e22;color:white;border-radius:10px;"
+                        "padding:2px 8px;font-size:0.75em'>Retail</span>"
+                    )
+                if not _is_active:
+                    _type_badge += (
+                        " <span style='background:#95a5a6;color:white;border-radius:10px;"
+                        "padding:2px 8px;font-size:0.75em'>Inactive</span>"
+                    )
+                _loc_name = _site_data.get("location_name", "")
+                _addr = _site_data.get("address", "No address")
+                _display = f"**Store {_site_id}** {_type_badge}"
+                if _loc_name:
+                    _display += f" — {_loc_name}"
+                if _addr and _addr != "No address":
+                    _display += f" · {_addr}"
+                elif not _loc_name:
+                    _display += " — No address"
+
                 _col_info, _col_remove = st.columns([6, 1])
-                _col_info.markdown(
-                    f"**Store {_site_id}** {_type_badge} — {_site_data.get('address', 'No address')}",
-                    unsafe_allow_html=True,
-                )
+                _col_info.markdown(_display, unsafe_allow_html=True)
                 if _col_remove.button("Remove", key=f"ef_rm_{_sel_entity_label}_{_site_id}"):
                     del _sel_sites[_site_id]
                     _ef[_sel_entity_label]["sites"] = _sel_sites
@@ -2187,24 +2211,38 @@ with tab_entity:
         else:
             st.info("No sites configured for this entity yet.")
 
-        st.markdown("#### Add site")
+        st.markdown("#### Add site or satellite clinic")
         with st.form(f"ef_add_site_{_sel_entity_label}"):
-            _sa_c1, _sa_c2, _sa_c3 = st.columns(3)
+            _sa_c1, _sa_c2 = st.columns(2)
             _sa_store = _sa_c1.text_input(
                 "Store / Site number",
                 placeholder="e.g. 106540",
                 key=f"ef_sa_store_{_sel_entity_label}",
+                help="The pharmacy system store ID (from RX STOREID in the rx log).",
             )
-            _sa_addr  = _sa_c2.text_input(
+            _sa_loc_name = _sa_c2.text_input(
+                "Location name (optional)",
+                placeholder="e.g. Southside Pediatrics, Bankhead Clinic",
+                key=f"ef_sa_locname_{_sel_entity_label}",
+                help="Clinic or satellite name — used to match EHR 'Location' column.",
+            )
+            _sa_c3, _sa_c4, _sa_c5 = st.columns(3)
+            _sa_addr  = _sa_c3.text_input(
                 "Site address",
                 placeholder="e.g. 1046 Ridge Ave SW, Atlanta, GA 30315",
                 key=f"ef_sa_addr_{_sel_entity_label}",
+                help="Physical address — used to match rx log DOCADD1 and validate prescriber locations.",
             )
-            _sa_type  = _sa_c3.selectbox(
+            _sa_type  = _sa_c4.selectbox(
                 "Site type",
-                options=["340B", "Retail"],
-                help="340B = eligible dispense site. Retail = standard retail, not 340B.",
+                options=["340B", "340B Satellite", "Retail"],
+                help="340B = main dispense site. 340B Satellite = off-site clinic eligible for 340B. Retail = non-340B.",
                 key=f"ef_sa_type_{_sel_entity_label}",
+            )
+            _sa_active = _sa_c5.selectbox(
+                "Status",
+                options=["Active", "Inactive"],
+                key=f"ef_sa_active_{_sel_entity_label}",
             )
             if st.form_submit_button("➕ Add site"):
                 _sid = _sa_store.strip()
@@ -2212,19 +2250,21 @@ with tab_entity:
                     st.error("Store number is required.")
                 else:
                     _ef[_sel_entity_label]["sites"][_sid] = {
-                        "address":   _sa_addr.strip(),
-                        "site_type": _sa_type,
+                        "address":       _sa_addr.strip(),
+                        "location_name": _sa_loc_name.strip(),
+                        "site_type":     _sa_type,
+                        "active":        _sa_active == "Active",
                     }
                     _save_entity_framework(_ef)
                     # Also sync 340B sites to site registry
-                    if _sa_type == "340B" and _sel_e.get("340B_ID"):
+                    if _sa_type.startswith("340B") and _sel_e.get("340B_ID"):
                         _sr = _cached_site_registry()["data"]
                         _sr[_sid] = {
                             "340B ID":       _sel_e["340B_ID"],
                             "Covered entity": _sel_e["name"],
                         }
                         _save_site_registry(_sr)
-                    st.success(f"Site {_sid} added as {_sa_type}.")
+                    st.success(f"Site {_sid} ({_sa_loc_name.strip() or _sa_addr.strip() or _sa_type}) added.")
                     st.rerun()
 
         # ── Import from current audit ──────────────────────────────────────────
