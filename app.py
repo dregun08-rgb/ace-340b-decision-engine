@@ -1430,11 +1430,12 @@ st.markdown("---")
 # TABS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-tab_queue, tab_all, tab_store, tab_exc, tab_prov, tab_entity, tab_ehr, tab_c20, tab_dl = st.tabs([
+tab_queue, tab_all, tab_store, tab_exc, tab_ref, tab_prov, tab_entity, tab_ehr, tab_c20, tab_dl = st.tabs([
     "⚠️ Review Queue",
     "📄 All Claims",
     "🏪 Store Status",
     "📋 Exception Management",
+    "🔀 Provider Referrals",
     "👨‍⚕️ Provider Registry",
     "🏢 Entity Frameworks",
     "🩺 EHR Encounters",
@@ -1882,6 +1883,214 @@ with tab_exc:
             data=exc_export.to_csv(index=False).encode(),
             file_name="ace_340b_exceptions_draft.csv",
             mime="text/csv",
+        )
+
+
+# ── TAB: Provider Referral Queue ─────────────────────────────────────────────
+
+with tab_ref:
+    st.subheader("🔀 Provider Referral Exception Queue")
+    st.markdown("""
+    Providers who wrote prescriptions in this audit but are **not found** in the 
+    Provider Registry or the uploaded Provider Master list are flagged here.
+    
+    For each unknown provider, confirm whether they are a **legitimate referral** 
+    (outside provider referring a patient to your covered entity) or a **true exception** 
+    requiring further investigation.
+    """)
+
+    # Initialize referral decisions in session state
+    if "_referral_decisions" not in st.session_state:
+        st.session_state["_referral_decisions"] = {}
+
+    # Build the set of known/registered provider NPIs
+    _known_npis: set[str] = set()
+
+    # From provider registry
+    _reg_df = _cached_registry()["df"]
+    if _reg_df is not None and not _reg_df.empty:
+        for _c in ("NPI", "Provider NPI", "provider_npi", "npi"):
+            if _c in _reg_df.columns:
+                _known_npis.update(
+                    _reg_df[_c].fillna("").astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+                )
+                break
+
+    # From provider master upload (session)
+    if provider_master_df is not None and not provider_master_df.empty:
+        for _c in ("NPI", "Provider NPI", "provider_npi", "npi"):
+            if _c in provider_master_df.columns:
+                _known_npis.update(
+                    provider_master_df[_c].fillna("").astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+                )
+                break
+
+    _known_npis.discard("")
+
+    # Find claims with providers NOT in the known set
+    if "Provider NPI" in claims.columns:
+        _claim_npis = claims["Provider NPI"].fillna("").astype(str).str.strip()
+        _unknown_mask = (~_claim_npis.isin(_known_npis)) & (_claim_npis != "")
+        _unknown_claims = claims[_unknown_mask].copy()
+
+        # Build provider-level summary
+        _prov_cols = ["Provider NPI"]
+        if "Prescribing provider" in claims.columns:
+            _prov_cols.append("Prescribing provider")
+        elif "Provider name" in claims.columns:
+            _prov_cols.append("Provider name")
+
+        if len(_unknown_claims) == 0:
+            st.success("✅ All prescribing providers are in the registry or master list. No referrals to review.")
+        else:
+            _unknown_providers = _unknown_claims.groupby("Provider NPI").agg(
+                Scripts=("Provider NPI", "count"),
+                Unique_Patients=("Patient name", "nunique") if "Patient name" in _unknown_claims.columns else ("Provider NPI", "count"),
+            ).reset_index()
+
+            # Add provider name if available
+            if "Prescribing provider" in _unknown_claims.columns:
+                _prov_name_map = _unknown_claims.groupby("Provider NPI")["Prescribing provider"].first()
+                _unknown_providers["Provider Name"] = _unknown_providers["Provider NPI"].map(_prov_name_map)
+            elif "Provider name" in _unknown_claims.columns:
+                _prov_name_map = _unknown_claims.groupby("Provider NPI")["Provider name"].first()
+                _unknown_providers["Provider Name"] = _unknown_providers["Provider NPI"].map(_prov_name_map)
+            else:
+                _unknown_providers["Provider Name"] = ""
+
+            # Add EHR data if crossref has run
+            if _ehr_datasets and "EHR provider" in claims.columns:
+                _ehr_prov_map = _unknown_claims.groupby("Provider NPI")["EHR provider"].first()
+                _unknown_providers["EHR Provider Name"] = _unknown_providers["Provider NPI"].map(_ehr_prov_map).fillna("")
+                _ehr_loc_map = _unknown_claims.groupby("Provider NPI")["EHR location"].first() if "EHR location" in _unknown_claims.columns else None
+                if _ehr_loc_map is not None:
+                    _unknown_providers["EHR Location"] = _unknown_providers["Provider NPI"].map(_ehr_loc_map).fillna("")
+
+            _unknown_providers = _unknown_providers.sort_values("Scripts", ascending=False).reset_index(drop=True)
+
+            # KPIs
+            _ref_total = len(_unknown_providers)
+            _ref_scripts = _unknown_claims.shape[0]
+            _ref_decided = sum(1 for npi in _unknown_providers["Provider NPI"]
+                               if npi in st.session_state["_referral_decisions"])
+            _ref_confirmed = sum(1 for npi, dec in st.session_state["_referral_decisions"].items()
+                                  if dec == "confirmed")
+            _ref_exception = sum(1 for npi, dec in st.session_state["_referral_decisions"].items()
+                                  if dec == "exception")
+            _ref_pending = _ref_total - _ref_decided
+
+            _rk1, _rk2, _rk3, _rk4, _rk5 = st.columns(5)
+            _rk1.metric("Unknown Providers", f"{_ref_total:,}")
+            _rk2.metric("Total Scripts", f"{_ref_scripts:,}")
+            _rk3.metric("⏳ Pending Review", f"{_ref_pending:,}")
+            _rk4.metric("✅ Confirmed Referrals", f"{_ref_confirmed:,}")
+            _rk5.metric("🚨 Exceptions", f"{_ref_exception:,}")
+
+            st.markdown("---")
+
+            # Filter view
+            _ref_view = st.radio(
+                "Show",
+                ["All", "Pending", "Confirmed Referrals", "Exceptions"],
+                horizontal=True,
+                key="_ref_filter",
+            )
+
+            # Interactive review for each unknown provider
+            for _ri, _rrow in _unknown_providers.iterrows():
+                _rnpi = _rrow["Provider NPI"]
+                _rname = _rrow.get("Provider Name", "")
+                _rscripts = _rrow["Scripts"]
+                _rdecision = st.session_state["_referral_decisions"].get(_rnpi, "pending")
+
+                # Apply filter
+                if _ref_view == "Pending" and _rdecision != "pending":
+                    continue
+                elif _ref_view == "Confirmed Referrals" and _rdecision != "confirmed":
+                    continue
+                elif _ref_view == "Exceptions" and _rdecision != "exception":
+                    continue
+
+                # Status badge
+                if _rdecision == "confirmed":
+                    _badge = "✅ Confirmed Referral"
+                    _badge_color = "#16a34a"
+                elif _rdecision == "exception":
+                    _badge = "🚨 Exception — Needs Investigation"
+                    _badge_color = "#dc2626"
+                else:
+                    _badge = "⏳ Pending Review"
+                    _badge_color = "#f59e0b"
+
+                with st.expander(
+                    f"{'✅' if _rdecision == 'confirmed' else '🚨' if _rdecision == 'exception' else '⏳'} "
+                    f"NPI: {_rnpi} — {_rname or 'Unknown'} — {_rscripts} script(s)",
+                    expanded=(_rdecision == "pending"),
+                ):
+                    st.markdown(
+                        f"<span style='background:{_badge_color};color:white;padding:3px 10px;"
+                        f"border-radius:12px;font-size:0.8em;font-weight:600'>{_badge}</span>",
+                        unsafe_allow_html=True,
+                    )
+
+                    # Show detail about this provider's claims
+                    _rprov_claims = _unknown_claims[_unknown_claims["Provider NPI"] == _rnpi]
+
+                    _detail_cols = [c for c in [
+                        "Prescription number", "Fill date", "Drug name", "Patient name",
+                        "Primary payer", "PRICE SCHED", "EHR provider", "EHR location",
+                        "EHR pharmacy", "EHR payer", "EHR medication", "EHR match",
+                    ] if c in _rprov_claims.columns]
+                    if _detail_cols:
+                        st.dataframe(
+                            _rprov_claims[_detail_cols].head(20).reset_index(drop=True),
+                            use_container_width=True, height=200,
+                        )
+
+                    st.markdown("**Is this provider a legitimate referral?**")
+                    _rc1, _rc2, _rc3 = st.columns(3)
+                    if _rc1.button(
+                        "✅ Yes — Confirmed Referral",
+                        key=f"ref_yes_{_rnpi}",
+                        type="primary" if _rdecision != "confirmed" else "secondary",
+                    ):
+                        st.session_state["_referral_decisions"][_rnpi] = "confirmed"
+                        _audit_log(f"Provider {_rnpi} ({_rname}) confirmed as referral")
+                        st.rerun()
+                    if _rc2.button(
+                        "🚨 No — Flag as Exception",
+                        key=f"ref_no_{_rnpi}",
+                        type="primary" if _rdecision != "exception" else "secondary",
+                    ):
+                        st.session_state["_referral_decisions"][_rnpi] = "exception"
+                        _audit_log(f"Provider {_rnpi} ({_rname}) flagged as exception")
+                        st.rerun()
+                    if _rdecision != "pending" and _rc3.button(
+                        "↩ Reset to Pending",
+                        key=f"ref_reset_{_rnpi}",
+                    ):
+                        del st.session_state["_referral_decisions"][_rnpi]
+                        st.rerun()
+
+            st.markdown("---")
+
+            # Export
+            _ref_export = _unknown_providers.copy()
+            _ref_export["Decision"] = _ref_export["Provider NPI"].map(
+                st.session_state["_referral_decisions"]
+            ).fillna("pending")
+
+            st.download_button(
+                "⬇ Export Referral Queue (CSV)",
+                data=_ref_export.to_csv(index=False).encode(),
+                file_name=f"ace_referral_queue_{datetime.date.today().isoformat()}.csv",
+                mime="text/csv",
+                key="ref_export",
+            )
+    else:
+        st.info(
+            "Provider NPI data not available in the current audit. "
+            "Upload an Rx Log with DR NPI or Provider NPI columns."
         )
 
 

@@ -34,6 +34,8 @@ CANONICAL: dict[str, str] = {
     "ndc":            "NDC",
     "diagnosis":      "Diagnosis code",
     "rx_number":      "Rx number",
+    "pharmacy":       "Pharmacy",
+    "payer":          "Payer",
 }
 
 # Fields surfaced in the EHR preview table (ordered)
@@ -49,6 +51,8 @@ EHR_DISPLAY_FIELDS: list[str] = [
     "NDC",
     "Diagnosis code",
     "Rx number",
+    "Pharmacy",
+    "Payer",
 ]
 
 # ── keyword hints for auto-column detection ──────────────────────────────────
@@ -120,6 +124,16 @@ _HINTS: dict[str, list[str]] = {
         "rx number", "rx#", "rxnbr", "prescription number", "rx nbr",
         "rx no", "rxno", "script number", "rx_number", "prescription#",
         "fill number",
+    ],
+    "pharmacy": [
+        "pharmacy", "pharmacy name", "dispensing pharmacy", "filling pharmacy",
+        "pharmacy location", "store", "pharmacy_name", "fill pharmacy",
+        "dispense pharmacy", "rx pharmacy",
+    ],
+    "payer": [
+        "payer", "payor", "insurance", "insurance plan", "plan name",
+        "primary payer", "primary insurance", "payer name", "plan",
+        "coverage", "insurance name", "payer_name", "carrier",
     ],
 }
 
@@ -292,11 +306,17 @@ def crossref_claims(
         - ``EHR provider``       : matched provider name from EHR (blank if no match)
         - ``EHR location``       : matched location from EHR (blank if no match)
         - ``EHR diagnosis``      : matched diagnosis code from EHR (blank if no match)
+        - ``EHR pharmacy``       : pharmacy from EHR encounter (blank if no match)
+        - ``EHR payer``          : payer/insurance from EHR encounter (blank if no match)
+        - ``EHR medication``     : medication from EHR encounter (blank if no match)
+        - ``EHR MRN``            : patient MRN from EHR (blank if no match)
         - ``EHR match method``   : which strategy produced the match
     """
     result = claims_df.copy()
     for col in ("EHR match", "EHR encounter date", "EHR provider",
-                "EHR location", "EHR diagnosis", "EHR match method"):
+                "EHR location", "EHR diagnosis", "EHR pharmacy",
+                "EHR payer", "EHR medication", "EHR MRN",
+                "EHR match method"):
         result[col] = ""
     result["EHR match"] = "N/A"
 
@@ -309,6 +329,9 @@ def crossref_claims(
     loc_col  = CANONICAL["location"]
     dx_col   = CANONICAL["diagnosis"]
     rx_col   = CANONICAL["rx_number"]
+    pharm_col = CANONICAL["pharmacy"]
+    payer_col = CANONICAL["payer"]
+    drug_col  = CANONICAL["drug_name"]
 
     fill_col      = "Fill date"
     claim_pat_col = "Patient name"
@@ -324,6 +347,9 @@ def crossref_claims(
     has_loc  = loc_col in ehr_df.columns
     has_dx   = dx_col in ehr_df.columns
     has_rx   = rx_col in ehr_df.columns
+    has_pharm = pharm_col in ehr_df.columns
+    has_payer = payer_col in ehr_df.columns
+    has_drug  = drug_col in ehr_df.columns
 
     has_claim_mrn = claim_mrn_col in claims_df.columns
     # Also check for "Patient key" (PATKEY) as alternate MRN in claims
@@ -359,6 +385,10 @@ def crossref_claims(
             "location": str(getattr(row, loc_col, "")).strip() if has_loc else "",
             "dx":       str(getattr(row, dx_col, "")).strip() if has_dx else "",
             "pat_name": str(getattr(row, pat_col, "")).strip() if has_pat else "",
+            "pharmacy": str(getattr(row, pharm_col, "")).strip() if has_pharm else "",
+            "payer":    str(getattr(row, payer_col, "")).strip() if has_payer else "",
+            "drug":     str(getattr(row, drug_col, "")).strip() if has_drug else "",
+            "mrn":      str(getattr(row, mrn_col, "")).strip() if has_mrn else "",
         }
 
     # Build fast lookup: MRN → list of EHR row dicts
@@ -419,6 +449,10 @@ def crossref_claims(
             "EHR provider":       entry.get("provider", ""),
             "EHR location":       entry.get("location", ""),
             "EHR diagnosis":      entry.get("dx", ""),
+            "EHR pharmacy":       entry.get("pharmacy", ""),
+            "EHR payer":          entry.get("payer", ""),
+            "EHR medication":     entry.get("drug", ""),
+            "EHR MRN":            entry.get("mrn", ""),
             "EHR match method":   method,
         }
 
@@ -426,7 +460,8 @@ def crossref_claims(
     def _match_row(row: Any) -> dict:
         out = {"EHR match": "NO MATCH", "EHR encounter date": "",
                "EHR provider": "", "EHR location": "", "EHR diagnosis": "",
-               "EHR match method": ""}
+               "EHR pharmacy": "", "EHR payer": "", "EHR medication": "",
+               "EHR MRN": "", "EHR match method": ""}
 
         fill = row["_fill"]
         pat  = row["_pat_norm"]
