@@ -48,6 +48,7 @@ _COLUMN_MAP: dict[str, str] = {
     "PATDOB":   "Patient DOB",
     "GENDER":   "Patient gender",
     "PATST":    "Patient state",
+    "PATZIP":   "Patient zip",
 }
 
 # Columns that must be present for a file to be treated as an RX log
@@ -82,6 +83,7 @@ def map_rx_log(
         "DOCNAMEFIRST", "DOCNAMELAST", "PATNAMEFIRST", "PATNAMELAST",
         "DOCADD1", "DOCADD2", "DOCCITY", "DOCST", "DOCZIP",
         "PRICE SCHED", "RXCOST", "RXPRICE", "QTY DSP",
+        "PATDOB", "PATST", "PATZIP",
     }
     _available = [c for c in df.columns if c in _keep]
     df = df[_available].copy()
