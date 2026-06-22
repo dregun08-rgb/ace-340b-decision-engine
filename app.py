@@ -1215,15 +1215,10 @@ with st.spinner("Running decision engine…"):
         cached = _load_results(source_path, pm_json, mef_json, exc_json, rules_json,
                                carve_status, input_format, site_reg_json, entity_fw_json,
                                _enc_key_hex)
-    except ValueError as _ve:
-        _msg = str(_ve)
-        if "not found" in _msg.lower() or "worksheet" in _msg.lower():
-            st.error(
-                "⚠️  **Workbook sheet not found.** Your Excel file must contain sheets named exactly: "
-                "`Raw_Data`, `Store_Map`, `Site_Entity_Map`. "
-                f"Detail: {_msg}"
-            )
-        elif "ehr_file_detected" in _msg.lower():
+    except (ValueError, Exception) as _exc:
+        _msg = str(_exc)
+        _msg_lo = _msg.lower()
+        if "ehr_file_detected" in _msg_lo:
             st.warning(
                 "📋  **This looks like an EHR patient/encounter file.**  "
                 "It cannot be used as the main 340B claims file here.\n\n"
@@ -1232,17 +1227,35 @@ with st.spinner("Running decision engine…"):
                 "column names and let you cross-reference encounters against your "
                 "340B claims."
             )
-        elif "rx-log format" in _msg.lower() or "required columns" in _msg.lower():
+        elif "not found" in _msg_lo or "worksheet" in _msg_lo or "no sheet" in _msg_lo:
+            st.error(
+                "⚠️  **Workbook sheet not found.** Your Excel file must contain sheets named exactly: "
+                "`Raw_Data`, `Store_Map`, `Site_Entity_Map`. "
+                f"Detail: {_msg}"
+            )
+        elif "rx-log format" in _msg_lo or "required columns" in _msg_lo:
             st.error(
                 "⚠️  **CSV format not recognised.** The uploaded CSV does not match the RX-log format. "
                 "Required columns: `RXNBR`, `FILLDATE`, `DRUG NAME`, `NDC`, `RX STOREID`, `DR NPI`. "
                 f"Detail: {_msg}"
             )
+        elif "decrypt" in _msg_lo or "session key" in _msg_lo or "invalidtoken" in _msg_lo or "token" in _msg_lo:
+            st.error(
+                "⚠️  **Session expired — please re-upload your file.**  "
+                "The encryption key from your previous session is no longer available. "
+                "Use the file uploader above to re-upload your 340B workbook."
+            )
+        elif "store number" in _msg_lo or "store_map" in _msg_lo:
+            st.error(
+                "⚠️  **Store_Map configuration error.** "
+                f"Detail: {_msg}"
+            )
         else:
-            st.error(f"⚠️  Error reading workbook: {_msg}")
-        st.stop()
-    except Exception as _exc:
-        st.error(f"⚠️  Unexpected error running audit: {_exc}")
+            st.error(
+                f"⚠️  **Engine error:** {_msg}\n\n"
+                "If this keeps happening, try re-uploading your file. "
+                "If the problem persists, check that all required workbook sheets are present and correctly named."
+            )
         st.stop()
 
 results        = _reconstruct(cached)
