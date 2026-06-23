@@ -616,7 +616,113 @@ if uploaded_file is not None:
                 "run on live claim data."
             )
 else:
-    st.info("👆 Upload a 340B workbook or RX log in the sidebar to begin your audit.")
+    # ── Getting Started tutorial (shown only when no file is uploaded) ────────
+    st.markdown("## Getting Started")
+    st.markdown(
+        "Upload your files using the **sidebar on the left** — the audit runs automatically "
+        "once a claims file is loaded. Follow the three steps below."
+    )
+    st.markdown("")
+
+    _step_css = """
+    <style>
+    .gs-card {
+        border: 1.5px solid #d0d7e2;
+        border-radius: 10px;
+        padding: 18px 20px 14px 20px;
+        background: #f8fafd;
+        position: relative;
+        margin-bottom: 6px;
+    }
+    .gs-card h4 { margin: 0 0 6px 0; font-size: 1.05rem; color: #1a3a5c; }
+    .gs-card p  { margin: 0; font-size: 0.88rem; color: #4a5568; line-height: 1.5; }
+    .gs-badge-req  { background:#c53030; color:#fff; border-radius:4px;
+                     padding:2px 7px; font-size:0.72rem; font-weight:700;
+                     margin-left:8px; vertical-align:middle; }
+    .gs-badge-opt  { background:#2b6cb0; color:#fff; border-radius:4px;
+                     padding:2px 7px; font-size:0.72rem; font-weight:700;
+                     margin-left:8px; vertical-align:middle; }
+    .gs-arrow {
+        font-size: 2.4rem;
+        color: #e53e3e;
+        text-align: center;
+        line-height: 1;
+        padding-top: 28px;
+        animation: pulse-arrow 1.4s ease-in-out infinite;
+    }
+    @keyframes pulse-arrow {
+        0%,100% { opacity: 1; transform: translateX(0); }
+        50%      { opacity: 0.55; transform: translateX(-6px); }
+    }
+    </style>
+    """
+    st.markdown(_step_css, unsafe_allow_html=True)
+
+    _c1, _c2, _c3 = st.columns([1, 8, 1])
+
+    with _c1:
+        st.markdown('<div class="gs-arrow">◀</div>', unsafe_allow_html=True)
+    with _c2:
+        st.markdown("""
+        <div class="gs-card">
+          <h4>Step 1 — Upload your claims file
+            <span class="gs-badge-req">REQUIRED</span>
+          </h4>
+          <p>
+            In the sidebar, under <strong>"Data inputs"</strong>, upload one of:<br>
+            &nbsp;• <strong>340B Workbook (.xlsx)</strong> — needs sheets: <em>Raw_Data, Store_Map, Site_Entity_Map</em><br>
+            &nbsp;• <strong>RX-log CSV (.csv)</strong> — needs columns: <em>RXNBR, FILLDATE, DRUG NAME, NDC, RX STOREID, DR NPI</em>
+          </p>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown("")
+    _d1, _d2, _d3 = st.columns([1, 8, 1])
+
+    with _d1:
+        st.markdown('<div class="gs-arrow">◀</div>', unsafe_allow_html=True)
+    with _d2:
+        st.markdown("""
+        <div class="gs-card">
+          <h4>Step 2 — Upload EHR encounter data
+            <span class="gs-badge-opt">OPTIONAL</span>
+          </h4>
+          <p>
+            In the sidebar, open <strong>"🩺 EHR Encounter Data"</strong> and upload up to 5 files
+            (CSV or Excel) from your EHR system.<br>
+            The tool auto-detects columns like <em>Patient, Effective Date, Rendering Provider,
+            Medication, MRN, Location</em> — no manual mapping needed.<br>
+            Used to cross-reference encounters against 340B claims.
+          </p>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown("")
+    _e1, _e2, _e3 = st.columns([1, 8, 1])
+
+    with _e1:
+        st.markdown('<div class="gs-arrow">◀</div>', unsafe_allow_html=True)
+    with _e2:
+        st.markdown("""
+        <div class="gs-card">
+          <h4>Step 3 — Upload optional supporting files
+            <span class="gs-badge-opt">OPTIONAL</span>
+          </h4>
+          <p>
+            Also in the sidebar:<br>
+            &nbsp;• <strong>Provider master (CSV or Excel)</strong> — provider NPI list for prescriber validation<br>
+            &nbsp;• <strong>MEF / Code 20 file (CSV or Excel)</strong> — Medicaid Exclusion File for carve-in
+            entities; required if you bill Medicaid with NDC Qualifier Code 20<br>
+            &nbsp;• <strong>Exceptions CSV</strong> — known-good claims to exclude from flagging
+          </p>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown("---")
+    st.caption(
+        "Questions? The **Provider Registry** and **Entity Frameworks** tabs let you "
+        "register 340B sites and covered entities without re-uploading data each time."
+    )
     st.stop()
 
 # Build provider_master_df: registry (persisted) + optional session upload, merged
