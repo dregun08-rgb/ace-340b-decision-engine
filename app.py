@@ -1194,12 +1194,21 @@ def _load_results(path, pm_json, mef_json, exc_json, rules_json, carve,
                     continue
                 _sm_mask = sm_df["Store number"].astype(str).str.strip() == str(_sid).strip()
                 # Only fill if entity framework hasn't already set a 340B ID
-                _already = sm_df.loc[_sm_mask, "340B ID"].astype(str).str.strip().ne("").any() if _sm_mask.any() else False
+                # Guard: column may not exist yet on RX-log derived store maps
+                _already = (
+                    sm_df.loc[_sm_mask, "340B ID"].astype(str).str.strip().ne("").any()
+                    if _sm_mask.any() and "340B ID" in sm_df.columns
+                    else False
+                )
                 if _sm_mask.any() and not _already:
                     sm_df.loc[_sm_mask, "340B ID"]        = _b340
                     sm_df.loc[_sm_mask, "Covered entity"] = _entity
                 _se_mask = se_df["Site location"].astype(str).str.strip() == str(_sid).strip()
-                _se_already = se_df.loc[_se_mask, "340B ID"].astype(str).str.strip().ne("").any() if _se_mask.any() else False
+                _se_already = (
+                    se_df.loc[_se_mask, "340B ID"].astype(str).str.strip().ne("").any()
+                    if _se_mask.any() and "340B ID" in se_df.columns
+                    else False
+                )
                 if _se_mask.any() and not _se_already:
                     se_df.loc[_se_mask, "340B ID"]        = _b340
                     se_df.loc[_se_mask, "Covered entity"] = _entity
