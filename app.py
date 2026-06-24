@@ -3,6 +3,7 @@ ACE 340B Decision Engine — Streamlit Dashboard
 """
 from __future__ import annotations
 
+import base64
 import datetime
 import gc
 import io
@@ -78,6 +79,18 @@ def _mask_phi(df: pd.DataFrame) -> pd.DataFrame:
             lambda x: "***" + x.strip()[-4:] if len(x.strip()) >= 4 else "***"
         )
     return df
+
+
+def _write_temp(data: bytes, suffix: str) -> str:
+    """Encrypt data with the session Fernet key and write to a temp file."""
+    enc_data = Fernet(_get_enc_key()).encrypt(data)
+    with tempfile.NamedTemporaryFile(suffix=suffix + ".enc", delete=False) as f:
+        f.write(enc_data)
+        path = f.name
+    if "_temp_files" not in st.session_state:
+        st.session_state["_temp_files"] = []
+    st.session_state["_temp_files"].append(path)
+    return path
 
 
 st.set_page_config(page_title="ACE 340B Decision Engine", page_icon="⚕️", layout="wide")
@@ -247,7 +260,126 @@ def _cached_site_registry():
 #       }
 #     }
 #   }
-_ENTITY_FW = Path(__file__).resolve().parent / "entity_frameworks.json"
+_ENTITY_FW    = Path(__file__).resolve().parent / "entity_frameworks.json"
+_SESSIONS_DIR = Path(__file__).resolve().parent / "saved_sessions"
+
+
+# ── saved audit sessions ───────────────────────────────────────────────────────
+
+def _derive_persistent_key() -> bytes:
+    """
+    Stable Fernet key derived from the app password via PBKDF2.
+    Unlike the per-session key, this one survives session restarts so saved
+    audit bundles can be decrypted in a later session.
+    """
+    import hashlib as _hl
+    pwd = st.secrets.get("APP_PASSWORD", "ace340b_local_dev").encode()
+    raw = _hl.pbkdf2_hmac("sha256", pwd, b"ace340b_session_v1", 100_000)
+    return base64.urlsafe_b64encode(raw)
+
+
+def _list_sessions() -> list[str]:
+    """Return sorted list of saved audit session names."""
+    if not _SESSIONS_DIR.exists():
+        return []
+    return sorted(p.stem for p in _SESSIONS_DIR.glob("*.enc"))
+
+
+def _save_session(name: str) -> str | None:
+    """
+    Save the current audit state (claims file, EHR data, MEF, exceptions,
+    carve setting) to an encrypted file on disk.
+    Returns None on success, or an error string on failure.
+    """
+    try:
+        # Collect main claims file bytes
+        wb_bytes_b64 = None
+        wb_path = st.session_state.get("_wb_path")
+        if wb_path and Path(wb_path).exists():
+            _raw_enc = Path(wb_path).read_bytes()
+            _dec     = Fernet(_get_enc_key()).decrypt(_raw_enc)
+            wb_bytes_b64 = base64.b64encode(_dec).decode()
+
+        # Collect EHR datasets (already stored as JSON in session_state)
+        ehr: dict = {}
+        for _i in range(1, 6):
+            _j = st.session_state.get(f"_ehr_raw_json_{_i}")
+            _n = st.session_state.get(f"_ehr_file_name_{_i}", f"EHR {_i}")
+            if _j:
+                ehr[str(_i)] = {"name": _n, "json": _j}
+
+        payload = {
+            "version":       1,
+            "name":          name,
+            "created_at":    datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "wb_filename":   st.session_state.get("_wb_filename", ""),
+            "wb_suffix":     st.session_state.get("_wb_suffix", ".xlsx"),
+            "wb_format":     st.session_state.get("_wb_format", "excel"),
+            "wb_bytes_b64":  wb_bytes_b64,
+            "mef_json":      st.session_state.get("_saved_mef_json"),
+            "exc_json":      st.session_state.get("_saved_exc_json"),
+            "ehr":           ehr,
+            "carve_status":  st.session_state.get("_auto_carve", "unknown"),
+        }
+
+        _SESSIONS_DIR.mkdir(exist_ok=True)
+        key       = _derive_persistent_key()
+        encrypted = Fernet(key).encrypt(json.dumps(payload).encode())
+        (_SESSIONS_DIR / f"{name}.enc").write_bytes(encrypted)
+        return None
+    except Exception as _e:
+        return str(_e)
+
+
+def _load_session(name: str) -> str | None:
+    """
+    Decrypt and restore a saved audit session into session_state.
+    Returns None on success, or an error string on failure.
+    """
+    try:
+        path = _SESSIONS_DIR / f"{name}.enc"
+        if not path.exists():
+            return f"Session '{name}' not found."
+        key     = _derive_persistent_key()
+        payload = json.loads(Fernet(key).decrypt(path.read_bytes()).decode())
+
+        # Restore main claims file
+        if payload.get("wb_bytes_b64"):
+            _wb_bytes = base64.b64decode(payload["wb_bytes_b64"])
+            _suffix   = payload.get("wb_suffix", ".xlsx")
+            _new_path = _write_temp(_wb_bytes, _suffix)
+            st.session_state["_wb_file_id"]  = f"saved::{name}"
+            st.session_state["_wb_path"]     = _new_path
+            st.session_state["_wb_format"]   = payload.get("wb_format", "excel")
+            st.session_state["_wb_filename"] = payload.get("wb_filename", name)
+            st.session_state["_wb_suffix"]   = _suffix
+
+        # Restore EHR datasets
+        for _slot, _ehr in payload.get("ehr", {}).items():
+            _i = int(_slot)
+            st.session_state[f"_ehr_raw_json_{_i}"]  = _ehr.get("json")
+            st.session_state[f"_ehr_file_name_{_i}"] = _ehr.get("name", f"EHR {_i}")
+            st.session_state[f"_ehr_file_id_{_i}"]   = f"saved::{name}::{_i}"
+
+        # Restore MEF / exceptions
+        if payload.get("mef_json"):
+            st.session_state["_saved_mef_json"] = payload["mef_json"]
+        if payload.get("exc_json"):
+            st.session_state["_saved_exc_json"] = payload["exc_json"]
+
+        # Restore carve status
+        if payload.get("carve_status"):
+            st.session_state["_auto_carve"] = payload["carve_status"]
+
+        return None
+    except Exception as _e:
+        return str(_e)
+
+
+def _delete_session(name: str) -> None:
+    path = _SESSIONS_DIR / f"{name}.enc"
+    if path.exists():
+        path.unlink()
 
 
 def _load_entity_framework() -> dict:
@@ -395,6 +527,45 @@ with st.sidebar.expander(
 
 st.sidebar.markdown("---")
 
+# ── 💾 Saved Audits ───────────────────────────────────────────────────────────
+with st.sidebar.expander("💾 Saved Audits", expanded=False):
+    _saved_list = _list_sessions()
+    if _saved_list:
+        _sel_sess = st.selectbox(
+            "Load saved audit", ["— select —"] + _saved_list, key="_sess_sel"
+        )
+        _col_l, _col_d = st.columns(2)
+        if _col_l.button("▶ Load", key="_btn_load_sess", use_container_width=True):
+            if _sel_sess != "— select —":
+                _load_err = _load_session(_sel_sess)
+                if _load_err:
+                    st.error(f"Could not load: {_load_err}")
+                else:
+                    st.success(f"Loaded '{_sel_sess}'")
+                    st.rerun()
+        if _col_d.button("🗑 Delete", key="_btn_del_sess", use_container_width=True):
+            if _sel_sess != "— select —":
+                _delete_session(_sel_sess)
+                st.rerun()
+    else:
+        st.caption("No saved audits yet.")
+    st.divider()
+    _new_sess_name = st.text_input(
+        "Save current audit as…",
+        placeholder="e.g. April 2026 RX-log",
+        key="_sess_name_inp",
+    )
+    if st.button("💾 Save", key="_btn_save_sess", use_container_width=True):
+        if not _new_sess_name.strip():
+            st.warning("Enter a name first.")
+        else:
+            _save_err = _save_session(_new_sess_name.strip())
+            if _save_err:
+                st.error(f"Could not save: {_save_err}")
+            else:
+                st.success(f"✅ Saved as '{_new_sess_name.strip()}'")
+                st.rerun()
+
 # ── HIPAA / security sidebar ───────────────────────────────────────────────────
 _mask_phi_enabled = st.sidebar.checkbox(
     "🔒 Mask PHI in display", value=False, key="_phi_mask",
@@ -524,18 +695,6 @@ st.markdown("---")
 
 # ── resolve data sources ──────────────────────────────────────────────────────
 
-def _write_temp(data: bytes, suffix: str) -> str:
-    """Encrypt data with the session Fernet key and write to a temp file."""
-    enc_data = Fernet(_get_enc_key()).encrypt(data)
-    with tempfile.NamedTemporaryFile(suffix=suffix + ".enc", delete=False) as f:
-        f.write(enc_data)
-        path = f.name
-    if "_temp_files" not in st.session_state:
-        st.session_state["_temp_files"] = []
-    st.session_state["_temp_files"].append(path)
-    return path
-
-
 source_path: str | None = None
 input_format: str = "excel"   # "excel" | "csv" | "excel_rxlog"
 if uploaded_file is not None:
@@ -570,6 +729,8 @@ if uploaded_file is not None:
         st.session_state["_wb_file_id"]  = file_id
         st.session_state["_wb_path"]     = _write_temp(wb_bytes, suffix)
         st.session_state["_wb_format"]   = _fmt
+        st.session_state["_wb_filename"] = uploaded_file.name
+        st.session_state["_wb_suffix"]   = suffix
         _audit_log(
             f"File uploaded: {uploaded_file.name} "
             f"({len(wb_bytes):,} bytes) · format={_fmt} · encrypted=AES-256"
@@ -614,6 +775,27 @@ if uploaded_file is not None:
                 "340B ID and covered entity — this activates the entity/site-of-care check. "
                 "All other checks (NPI, NDC, encounter date, duplicate discount) "
                 "run on live claim data."
+            )
+elif (
+    st.session_state.get("_wb_path")
+    and Path(st.session_state["_wb_path"]).exists()
+):
+    # ── Restored from saved audit session — no new upload needed ─────────────
+    source_path  = st.session_state["_wb_path"]
+    input_format = st.session_state.get("_wb_format", "excel")
+    _saved_fname = st.session_state.get("_wb_filename", "saved audit")
+    st.sidebar.info(f"📂 Loaded from saved session: **{_saved_fname}**")
+    if input_format in ("csv", "excel_rxlog"):
+        _fmt_label       = "RX-log CSV" if input_format == "csv" else "RX-log Excel"
+        _reg_count_sites = len(_cached_site_registry()["data"])
+        if _reg_count_sites > 0:
+            st.sidebar.success(
+                f"{_fmt_label} detected. {_reg_count_sites} site(s) registered."
+            )
+        else:
+            st.sidebar.info(
+                f"{_fmt_label} detected. Go to **Store Status → 340B Site Registration** "
+                "to register your 340B ID and covered entity."
             )
 else:
     # ── Getting Started tutorial (shown only when no file is uploaded) ────────
@@ -794,14 +976,31 @@ if mef_file is not None:
             mef_df = pd.read_excel(mef_file)
         else:
             mef_df = pd.read_csv(mef_file)
+        st.session_state["_saved_mef_json"] = mef_df.to_json(orient="split")
         st.sidebar.success(f"MEF loaded: {len(mef_df):,} entities")
     except Exception as _e:
         st.sidebar.warning(f"Could not read MEF file: {_e}")
+elif st.session_state.get("_saved_mef_json"):
+    try:
+        mef_df = pd.read_json(io.StringIO(st.session_state["_saved_mef_json"]), orient="split")
+        st.sidebar.info(f"MEF loaded from saved session ({len(mef_df):,} entities).")
+    except Exception:
+        pass
 
 exceptions_df: pd.DataFrame | None = None
 if exceptions_file is not None:
-    exceptions_df = pd.read_csv(exceptions_file)
-    st.sidebar.success(f"Exceptions: {len(exceptions_df):,} records")
+    try:
+        exceptions_df = pd.read_csv(exceptions_file)
+        st.session_state["_saved_exc_json"] = exceptions_df.to_json(orient="split")
+        st.sidebar.success(f"Exceptions: {len(exceptions_df):,} records")
+    except Exception as _e:
+        st.sidebar.warning(f"Could not read exceptions file: {_e}")
+elif st.session_state.get("_saved_exc_json"):
+    try:
+        exceptions_df = pd.read_json(io.StringIO(st.session_state["_saved_exc_json"]), orient="split")
+        st.sidebar.info(f"Exceptions loaded from saved session ({len(exceptions_df):,} records).")
+    except Exception:
+        pass
 
 # ── EHR data loading (up to 5 datasets) ──────────────────────────────────────
 # _ehr_datasets: list of {idx, name, raw, norm, col_map} for each loaded slot
