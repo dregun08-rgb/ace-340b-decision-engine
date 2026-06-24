@@ -12,6 +12,7 @@ import os
 import tempfile
 import time
 import zipfile
+import zlib
 from pathlib import Path
 
 import pandas as pd
@@ -266,6 +267,15 @@ _SESSIONS_DIR = Path(__file__).resolve().parent / "saved_sessions"
 
 # ── saved audit sessions ───────────────────────────────────────────────────────
 
+def _fmt_size(n: int) -> str:
+    """Human-readable byte count."""
+    if n < 1_024:
+        return f"{n} B"
+    if n < 1_048_576:
+        return f"{n / 1_024:.1f} KB"
+    return f"{n / 1_048_576:.1f} MB"
+
+
 def _derive_persistent_key() -> bytes:
     """
     Stable Fernet key derived from the app password via PBKDF2.
@@ -278,54 +288,83 @@ def _derive_persistent_key() -> bytes:
     return base64.urlsafe_b64encode(raw)
 
 
-def _list_sessions() -> list[str]:
-    """Return sorted list of saved audit session names."""
+def _list_sessions() -> list[dict]:
+    """Return sorted list of saved session info dicts: {name, size, path}."""
     if not _SESSIONS_DIR.exists():
         return []
-    return sorted(p.stem for p in _SESSIONS_DIR.glob("*.enc"))
+    out = []
+    for p in sorted(_SESSIONS_DIR.glob("*.enc")):
+        try:
+            sz = p.stat().st_size
+        except OSError:
+            sz = 0
+        out.append({"name": p.stem, "size": sz, "path": p})
+    return out
 
 
 def _save_session(name: str) -> str | None:
     """
-    Save the current audit state (claims file, EHR data, MEF, exceptions,
-    carve setting) to an encrypted file on disk.
-    Returns None on success, or an error string on failure.
+    Save current audit state to an encrypted, zlib-compressed bundle.
+    Returns None on success or an error string on failure.
+
+    Storage optimisations
+    ─────────────────────
+    • Claims file bytes are zlib-compressed before base64 encoding (CSV
+      files typically shrink 5-10×; xlsx files are already deflated so
+      gain is minimal but still present on the JSON wrapper).
+    • EHR JSON uses compact separators and omits the row-index array
+      (orient='split', index=False).
+    • The entire JSON payload is zlib-compressed at level 9 before Fernet
+      encryption, giving a further 3-6× reduction on typical tabular data.
     """
     try:
-        # Collect main claims file bytes
+        # ── Claims file ───────────────────────────────────────────────────
         wb_bytes_b64 = None
-        wb_path = st.session_state.get("_wb_path")
+        wb_suffix    = st.session_state.get("_wb_suffix", ".xlsx")
+        wb_path      = st.session_state.get("_wb_path")
         if wb_path and Path(wb_path).exists():
-            _raw_enc = Path(wb_path).read_bytes()
-            _dec     = Fernet(_get_enc_key()).decrypt(_raw_enc)
-            wb_bytes_b64 = base64.b64encode(_dec).decode()
+            _raw_enc  = Path(wb_path).read_bytes()
+            _dec      = Fernet(_get_enc_key()).decrypt(_raw_enc)
+            # Pre-compress CSV bytes (xlsx already deflated internally)
+            _to_store = zlib.compress(_dec, level=9) if wb_suffix == ".csv" else _dec
+            wb_bytes_b64 = base64.b64encode(_to_store).decode()
 
-        # Collect EHR datasets (already stored as JSON in session_state)
+        # ── EHR datasets ──────────────────────────────────────────────────
         ehr: dict = {}
         for _i in range(1, 6):
             _j = st.session_state.get(f"_ehr_raw_json_{_i}")
             _n = st.session_state.get(f"_ehr_file_name_{_i}", f"EHR {_i}")
             if _j:
+                # Re-serialise without index to save space
+                try:
+                    _ehr_df = pd.read_json(io.StringIO(_j), orient="split")
+                    _j = _ehr_df.to_json(orient="split", index=False, separators=(",", ":"))
+                except Exception:
+                    pass  # keep original if re-serialise fails
                 ehr[str(_i)] = {"name": _n, "json": _j}
 
         payload = {
-            "version":       1,
-            "name":          name,
-            "created_at":    datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "wb_filename":   st.session_state.get("_wb_filename", ""),
-            "wb_suffix":     st.session_state.get("_wb_suffix", ".xlsx"),
-            "wb_format":     st.session_state.get("_wb_format", "excel"),
-            "wb_bytes_b64":  wb_bytes_b64,
-            "mef_json":      st.session_state.get("_saved_mef_json"),
-            "exc_json":      st.session_state.get("_saved_exc_json"),
-            "ehr":           ehr,
-            "carve_status":  st.session_state.get("_auto_carve", "unknown"),
+            "version":          2,
+            "name":             name,
+            "created_at":       datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "wb_filename":      st.session_state.get("_wb_filename", ""),
+            "wb_suffix":        wb_suffix,
+            "wb_format":        st.session_state.get("_wb_format", "excel"),
+            "wb_csv_compressed": wb_suffix == ".csv",   # flag for loader
+            "wb_bytes_b64":     wb_bytes_b64,
+            "mef_json":         st.session_state.get("_saved_mef_json"),
+            "exc_json":         st.session_state.get("_saved_exc_json"),
+            "ehr":              ehr,
+            "carve_status":     st.session_state.get("_auto_carve", "unknown"),
         }
 
+        # Compact JSON → zlib(9) → Fernet encrypt
+        _json_bytes = json.dumps(payload, separators=(",", ":")).encode()
+        _compressed = zlib.compress(_json_bytes, level=9)
+        _encrypted  = Fernet(_derive_persistent_key()).encrypt(_compressed)
+
         _SESSIONS_DIR.mkdir(exist_ok=True)
-        key       = _derive_persistent_key()
-        encrypted = Fernet(key).encrypt(json.dumps(payload).encode())
-        (_SESSIONS_DIR / f"{name}.enc").write_bytes(encrypted)
+        (_SESSIONS_DIR / f"{name}.enc").write_bytes(_encrypted)
         return None
     except Exception as _e:
         return str(_e)
@@ -334,19 +373,27 @@ def _save_session(name: str) -> str | None:
 def _load_session(name: str) -> str | None:
     """
     Decrypt and restore a saved audit session into session_state.
-    Returns None on success, or an error string on failure.
+    Handles both v2 (zlib-compressed) and v1 (uncompressed) bundles.
+    Returns None on success or an error string on failure.
     """
     try:
         path = _SESSIONS_DIR / f"{name}.enc"
         if not path.exists():
             return f"Session '{name}' not found."
-        key     = _derive_persistent_key()
-        payload = json.loads(Fernet(key).decrypt(path.read_bytes()).decode())
+        _raw = Fernet(_derive_persistent_key()).decrypt(path.read_bytes())
+        # v2 bundles are zlib-compressed; v1 are raw JSON
+        try:
+            _json_bytes = zlib.decompress(_raw)
+        except zlib.error:
+            _json_bytes = _raw
+        payload = json.loads(_json_bytes.decode())
 
-        # Restore main claims file
+        # ── Restore main claims file ───────────────────────────────────────
         if payload.get("wb_bytes_b64"):
-            _wb_bytes = base64.b64decode(payload["wb_bytes_b64"])
+            _stored   = base64.b64decode(payload["wb_bytes_b64"])
             _suffix   = payload.get("wb_suffix", ".xlsx")
+            # Decompress if CSV was pre-compressed on save
+            _wb_bytes = zlib.decompress(_stored) if payload.get("wb_csv_compressed") else _stored
             _new_path = _write_temp(_wb_bytes, _suffix)
             st.session_state["_wb_file_id"]  = f"saved::{name}"
             st.session_state["_wb_path"]     = _new_path
@@ -354,20 +401,18 @@ def _load_session(name: str) -> str | None:
             st.session_state["_wb_filename"] = payload.get("wb_filename", name)
             st.session_state["_wb_suffix"]   = _suffix
 
-        # Restore EHR datasets
+        # ── Restore EHR datasets ──────────────────────────────────────────
         for _slot, _ehr in payload.get("ehr", {}).items():
             _i = int(_slot)
             st.session_state[f"_ehr_raw_json_{_i}"]  = _ehr.get("json")
             st.session_state[f"_ehr_file_name_{_i}"] = _ehr.get("name", f"EHR {_i}")
             st.session_state[f"_ehr_file_id_{_i}"]   = f"saved::{name}::{_i}"
 
-        # Restore MEF / exceptions
+        # ── Restore MEF / exceptions / carve ─────────────────────────────
         if payload.get("mef_json"):
             st.session_state["_saved_mef_json"] = payload["mef_json"]
         if payload.get("exc_json"):
             st.session_state["_saved_exc_json"] = payload["exc_json"]
-
-        # Restore carve status
         if payload.get("carve_status"):
             st.session_state["_auto_carve"] = payload["carve_status"]
 
@@ -380,6 +425,26 @@ def _delete_session(name: str) -> None:
     path = _SESSIONS_DIR / f"{name}.enc"
     if path.exists():
         path.unlink()
+
+
+def _import_session(name: str, data: bytes) -> str | None:
+    """
+    Validate an uploaded .enc bundle and write it to _SESSIONS_DIR.
+    Returns None on success or an error string on failure.
+    """
+    try:
+        # Verify it decrypts and parses — catches wrong-key or corrupt files early
+        _raw = Fernet(_derive_persistent_key()).decrypt(data)
+        try:
+            _json_bytes = zlib.decompress(_raw)
+        except zlib.error:
+            _json_bytes = _raw
+        json.loads(_json_bytes.decode())   # must be valid JSON
+        _SESSIONS_DIR.mkdir(exist_ok=True)
+        (_SESSIONS_DIR / f"{name}.enc").write_bytes(data)
+        return None
+    except Exception as _e:
+        return str(_e)
 
 
 def _load_entity_framework() -> dict:
@@ -530,25 +595,65 @@ st.sidebar.markdown("---")
 # ── 💾 Saved Audits ───────────────────────────────────────────────────────────
 with st.sidebar.expander("💾 Saved Audits", expanded=False):
     _saved_list = _list_sessions()
+    _total_disk = sum(s["size"] for s in _saved_list)
+
     if _saved_list:
-        _sel_sess = st.selectbox(
-            "Load saved audit", ["— select —"] + _saved_list, key="_sess_sel"
+        st.caption(
+            f"💿 {len(_saved_list)} session(s) · {_fmt_size(_total_disk)} on server"
         )
-        _col_l, _col_d = st.columns(2)
-        if _col_l.button("▶ Load", key="_btn_load_sess", use_container_width=True):
-            if _sel_sess != "— select —":
-                _load_err = _load_session(_sel_sess)
-                if _load_err:
-                    st.error(f"Could not load: {_load_err}")
-                else:
-                    st.success(f"Loaded '{_sel_sess}'")
-                    st.rerun()
-        if _col_d.button("🗑 Delete", key="_btn_del_sess", use_container_width=True):
-            if _sel_sess != "— select —":
-                _delete_session(_sel_sess)
+        # Selectbox shows name + compressed size so user knows cost of each entry
+        _sess_labels = [f"{s['name']}  ({_fmt_size(s['size'])})" for s in _saved_list]
+        _sess_idx = st.selectbox(
+            "Select audit", range(len(_saved_list)),
+            format_func=lambda i: _sess_labels[i],
+            key="_sess_sel",
+        )
+        _sel = _saved_list[_sess_idx]
+
+        # Row 1: Load | Download
+        _ca, _cb = st.columns(2)
+        if _ca.button("▶ Load", key="_btn_load_sess", use_container_width=True):
+            _err = _load_session(_sel["name"])
+            if _err:
+                st.error(f"Load failed: {_err}")
+            else:
+                st.success(f"Loaded '{_sel['name']}'")
                 st.rerun()
+        _cb.download_button(
+            "⬇ Download",
+            data=_sel["path"].read_bytes(),
+            file_name=f"{_sel['name']}.enc",
+            mime="application/octet-stream",
+            key="_btn_dl_sess",
+            use_container_width=True,
+            help="Save an encrypted backup to your computer.",
+        )
+
+        # Row 2: Delete (full-width, prominent)
+        if st.button(
+            f"🗑 Delete from server  ({_fmt_size(_sel['size'])})",
+            key="_btn_del_sess",
+            use_container_width=True,
+            help="Permanently removes this session from the server. "
+                 "Download a backup first if you want to keep it.",
+        ):
+            _delete_session(_sel["name"])
+            st.rerun()
+
+        st.caption("💡 Download a backup before deleting — import it anytime below.")
+
+        # Delete ALL shortcut
+        if len(_saved_list) > 1:
+            with st.popover(f"🗑 Delete all  ({_fmt_size(_total_disk)} freed)"):
+                st.warning("This permanently removes **all** saved sessions from the server.")
+                if st.button("Confirm — delete all sessions", key="_btn_del_all"):
+                    for _s in _saved_list:
+                        _delete_session(_s["name"])
+                    st.rerun()
     else:
         st.caption("No saved audits yet.")
+
+    # ── Save current audit ─────────────────────────────────────────────────
     st.divider()
     _new_sess_name = st.text_input(
         "Save current audit as…",
@@ -563,7 +668,28 @@ with st.sidebar.expander("💾 Saved Audits", expanded=False):
             if _save_err:
                 st.error(f"Could not save: {_save_err}")
             else:
-                st.success(f"✅ Saved as '{_new_sess_name.strip()}'")
+                _new_info = _list_sessions()
+                _new_sz   = next((s["size"] for s in _new_info if s["name"] == _new_sess_name.strip()), 0)
+                st.success(f"✅ Saved '{_new_sess_name.strip()}' — {_fmt_size(_new_sz)} on server")
+                st.rerun()
+
+    # ── Import backup ──────────────────────────────────────────────────────
+    st.divider()
+    st.caption("**Import backup**")
+    _imp_file = st.file_uploader(
+        "Upload .enc backup file",
+        type=["enc"],
+        key="_sess_import",
+        help="Re-upload a previously downloaded .enc file to restore it on this server.",
+    )
+    if _imp_file is not None:
+        _imp_name = Path(_imp_file.name).stem
+        if st.button("Import", key="_btn_import_sess", use_container_width=True):
+            _imp_err = _import_session(_imp_name, _imp_file.getbuffer().tobytes())
+            if _imp_err:
+                st.error(f"Import failed: {_imp_err}")
+            else:
+                st.success(f"Imported '{_imp_name}'")
                 st.rerun()
 
 # ── HIPAA / security sidebar ───────────────────────────────────────────────────
