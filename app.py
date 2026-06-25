@@ -356,6 +356,9 @@ def _save_session(name: str) -> str | None:
             "exc_json":         st.session_state.get("_saved_exc_json"),
             "ehr":              ehr,
             "carve_status":     st.session_state.get("_auto_carve", "unknown"),
+            # Entity and site config — persists across server restarts
+            "entity_fw":        _cached_entity_framework()["data"],
+            "site_registry":    _cached_site_registry()["data"],
         }
 
         # Compact JSON → zlib(9) → Fernet encrypt
@@ -415,6 +418,16 @@ def _load_session(name: str) -> str | None:
             st.session_state["_saved_exc_json"] = payload["exc_json"]
         if payload.get("carve_status"):
             st.session_state["_auto_carve"] = payload["carve_status"]
+
+        # ── Restore entity frameworks + site registry ─────────────────
+        # Write back to disk so the engine and Entity Frameworks tab
+        # have the correct data immediately without any re-entry.
+        if payload.get("entity_fw"):
+            _save_entity_framework(payload["entity_fw"])
+            _cached_entity_framework.clear()
+        if payload.get("site_registry"):
+            _save_site_registry(payload["site_registry"])
+            _cached_site_registry.clear()
 
         return None
     except Exception as _e:
@@ -2976,6 +2989,84 @@ with tab_entity:
                 _save_entity_framework(_ef)
                 st.success("Entity deleted.")
                 st.rerun()
+
+    # ── Backup & Restore ──────────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("### 💾 Backup & Restore")
+    st.caption(
+        "Export your entity and site configuration as an encrypted backup. "
+        "Import it after a server restart or on a new device so you never "
+        "have to re-enter entities and sites by hand."
+    )
+
+    _ef_backup_cols = st.columns(2)
+
+    # ── Export ─────────────────────────────────────────────────────────────
+    with _ef_backup_cols[0]:
+        st.markdown("**Export entity config**")
+        if _ef or _cached_site_registry()["data"]:
+            _ef_export_payload = {
+                "version":       "entity_config_v1",
+                "created_at":    datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "entity_fw":     _cached_entity_framework()["data"],
+                "site_registry": _cached_site_registry()["data"],
+            }
+            _ef_export_json    = json.dumps(_ef_export_payload, separators=(",", ":")).encode()
+            _ef_export_comp    = zlib.compress(_ef_export_json, level=9)
+            _ef_export_enc     = Fernet(_derive_persistent_key()).encrypt(_ef_export_comp)
+            st.download_button(
+                "⬇ Download entity backup",
+                data=_ef_export_enc,
+                file_name="entity_config.enc",
+                mime="application/octet-stream",
+                key="ef_dl_backup",
+                use_container_width=True,
+                help="Encrypted backup of all entities, sites, and carve settings.",
+            )
+            st.caption(
+                f"{_fmt_size(len(_ef_export_enc))} · "
+                f"{len(_ef)} entit{'y' if len(_ef)==1 else 'ies'} · "
+                f"{sum(len(v.get('sites',{})) for v in _ef.values())} site(s)"
+            )
+        else:
+            st.info("No entity config to export yet.")
+
+    # ── Import ─────────────────────────────────────────────────────────────
+    with _ef_backup_cols[1]:
+        st.markdown("**Import entity config**")
+        _ef_imp_file = st.file_uploader(
+            "Upload entity_config.enc",
+            type=["enc"],
+            key="ef_import_backup",
+            help="Upload a previously downloaded entity_config.enc file.",
+        )
+        if _ef_imp_file is not None:
+            if st.button("Restore from backup", key="ef_btn_import", use_container_width=True, type="primary"):
+                try:
+                    _ef_imp_raw  = Fernet(_derive_persistent_key()).decrypt(_ef_imp_file.getbuffer().tobytes())
+                    try:
+                        _ef_imp_json = zlib.decompress(_ef_imp_raw)
+                    except zlib.error:
+                        _ef_imp_json = _ef_imp_raw
+                    _ef_imp_data = json.loads(_ef_imp_json.decode())
+                    if "entity_fw" in _ef_imp_data:
+                        _save_entity_framework(_ef_imp_data["entity_fw"])
+                        _cached_entity_framework.clear()
+                    if "site_registry" in _ef_imp_data:
+                        _save_site_registry(_ef_imp_data["site_registry"])
+                        _cached_site_registry.clear()
+                    _ef_n = len(_ef_imp_data.get("entity_fw", {}))
+                    _ef_s = sum(len(v.get("sites", {})) for v in _ef_imp_data.get("entity_fw", {}).values())
+                    st.success(f"Restored {_ef_n} entit{'y' if _ef_n==1 else 'ies'} and {_ef_s} site(s).")
+                    st.rerun()
+                except Exception as _ef_ie:
+                    st.error(f"Import failed: {_ef_ie}")
+
+    st.info(
+        "💡 **Tip:** Your entity config is also automatically included whenever you "
+        "save a session via **💾 Saved Audits** in the sidebar — loading any saved "
+        "session will restore your entities and sites as well."
+    )
 
 
 # ── TAB 7: EHR Encounters ─────────────────────────────────────────────────────
