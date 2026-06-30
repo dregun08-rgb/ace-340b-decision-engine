@@ -2965,7 +2965,178 @@ with tab_entity:
                     st.success(f"Site {_sid} ({_sa_loc_name.strip() or _sa_addr.strip() or _sa_type}) added.")
                     st.rerun()
 
-        # ── Import from current audit ──────────────────────────────────────────
+        # ── Bulk upload from Excel ─────────────────────────────────────────────
+        st.markdown("#### Upload 340B eligible locations")
+        st.caption(
+            "Upload an Excel or CSV file with your list of 340B eligible addresses. "
+            "The engine will import each row as a site for the selected entity."
+        )
+        _site_upload = st.file_uploader(
+            "Site address list",
+            type=["xlsx", "xls", "csv"],
+            help=(
+                "Excel or CSV with columns for address information. "
+                "The engine looks for columns like: Store Number, Store ID, Site ID, "
+                "Address, Location, Site Name, Site Type, City, State, Zip, etc. "
+                "Any column containing address information will be detected."
+            ),
+            key=f"ef_site_upload_{_sel_entity_label}",
+        )
+        if _site_upload is not None:
+            try:
+                _site_upload.seek(0)
+                if _site_upload.name.lower().endswith(".csv"):
+                    _sites_df = pd.read_csv(_site_upload, dtype=str)
+                else:
+                    _sites_df = pd.read_excel(_site_upload, dtype=str)
+                _sites_df.columns = _sites_df.columns.str.strip()
+
+                if _sites_df.empty:
+                    st.warning("Uploaded file is empty.")
+                else:
+                    st.markdown(f"**{len(_sites_df)} rows found.** Preview:")
+                    st.dataframe(_sites_df.head(10), use_container_width=True, height=200)
+
+                    # ── Auto-detect column mapping ────────────────────────────
+                    _cols_lower = {c: c.lower().strip() for c in _sites_df.columns}
+
+                    def _find_col(keywords):
+                        for col, lower in _cols_lower.items():
+                            if any(kw in lower for kw in keywords):
+                                return col
+                        return None
+
+                    _det_store = _find_col(["store number", "store id", "store #", "store nbr",
+                                            "site id", "site number", "site #", "location id",
+                                            "rx-store", "storeid"])
+                    _det_name = _find_col(["name", "location name", "site name", "clinic",
+                                           "facility", "location"])
+                    _det_addr = _find_col(["address", "street", "add1", "address1", "addr",
+                                           "site address", "physical address"])
+                    _det_city = _find_col(["city"])
+                    _det_state = _find_col(["state", "st"])
+                    _det_zip = _find_col(["zip", "postal", "zip code", "zipcode"])
+                    _det_type = _find_col(["type", "site type", "designation", "340b",
+                                           "eligible", "status"])
+
+                    # Let user confirm/override column mapping
+                    st.markdown("**Column mapping** — confirm or change:")
+                    _all_cols = ["(none)"] + list(_sites_df.columns)
+                    _mc1, _mc2 = st.columns(2)
+                    _map_store = _mc1.selectbox("Store/Site number column", _all_cols,
+                        index=_all_cols.index(_det_store) if _det_store in _all_cols else 0,
+                        key=f"ef_map_store_{_sel_entity_label}")
+                    _map_name = _mc2.selectbox("Location name column", _all_cols,
+                        index=_all_cols.index(_det_name) if _det_name in _all_cols else 0,
+                        key=f"ef_map_name_{_sel_entity_label}")
+                    _mc3, _mc4, _mc5, _mc6 = st.columns(4)
+                    _map_addr = _mc3.selectbox("Address column", _all_cols,
+                        index=_all_cols.index(_det_addr) if _det_addr in _all_cols else 0,
+                        key=f"ef_map_addr_{_sel_entity_label}")
+                    _map_city = _mc4.selectbox("City column", _all_cols,
+                        index=_all_cols.index(_det_city) if _det_city in _all_cols else 0,
+                        key=f"ef_map_city_{_sel_entity_label}")
+                    _map_state = _mc5.selectbox("State column", _all_cols,
+                        index=_all_cols.index(_det_state) if _det_state in _all_cols else 0,
+                        key=f"ef_map_state_{_sel_entity_label}")
+                    _map_zip = _mc6.selectbox("Zip column", _all_cols,
+                        index=_all_cols.index(_det_zip) if _det_zip in _all_cols else 0,
+                        key=f"ef_map_zip_{_sel_entity_label}")
+
+                    _map_type = st.selectbox("Site type column (optional)", _all_cols,
+                        index=_all_cols.index(_det_type) if _det_type in _all_cols else 0,
+                        key=f"ef_map_type_{_sel_entity_label}")
+
+                    _default_type = st.radio(
+                        "Default site type for imported sites",
+                        ["340B", "340B Satellite", "Retail"],
+                        horizontal=True,
+                        key=f"ef_default_type_{_sel_entity_label}",
+                    )
+
+                    if st.button(
+                        f"📥 Import {len(_sites_df)} site(s) into {_sel_e.get('name', _sel_entity_label)}",
+                        type="primary",
+                        key=f"ef_import_upload_{_sel_entity_label}",
+                    ):
+                        _imported = 0
+                        _sr = _cached_site_registry()["data"]
+                        for _, _srow in _sites_df.iterrows():
+                            # Build store ID
+                            if _map_store != "(none)":
+                                _sid = str(_srow.get(_map_store, "")).strip()
+                                if not _sid or _sid == "nan":
+                                    _sid = f"site_{_imported + 1}"
+                            else:
+                                _sid = f"site_{_imported + 1}"
+
+                            # Build address
+                            _addr_parts = []
+                            if _map_addr != "(none)":
+                                _a = str(_srow.get(_map_addr, "")).strip()
+                                if _a and _a != "nan":
+                                    _addr_parts.append(_a)
+                            if _map_city != "(none)":
+                                _c = str(_srow.get(_map_city, "")).strip()
+                                if _c and _c != "nan":
+                                    _addr_parts.append(_c)
+                            _state_zip = []
+                            if _map_state != "(none)":
+                                _s = str(_srow.get(_map_state, "")).strip()
+                                if _s and _s != "nan":
+                                    _state_zip.append(_s)
+                            if _map_zip != "(none)":
+                                _z = str(_srow.get(_map_zip, "")).strip()
+                                if _z and _z != "nan":
+                                    _state_zip.append(_z)
+                            if _state_zip:
+                                _addr_parts.append(" ".join(_state_zip))
+                            _full_addr = ", ".join(_addr_parts) if _addr_parts else ""
+
+                            # Location name
+                            _loc_name = ""
+                            if _map_name != "(none)":
+                                _ln = str(_srow.get(_map_name, "")).strip()
+                                if _ln and _ln != "nan":
+                                    _loc_name = _ln
+
+                            # Site type
+                            _stype = _default_type
+                            if _map_type != "(none)":
+                                _st = str(_srow.get(_map_type, "")).strip().upper()
+                                if "SATELLITE" in _st:
+                                    _stype = "340B Satellite"
+                                elif "RETAIL" in _st:
+                                    _stype = "Retail"
+                                elif "340B" in _st or "ELIGIBLE" in _st or "YES" in _st or "Y" == _st:
+                                    _stype = "340B"
+
+                            _ef[_sel_entity_label]["sites"][_sid] = {
+                                "address":       _full_addr,
+                                "location_name": _loc_name,
+                                "site_type":     _stype,
+                                "active":        True,
+                            }
+
+                            # Sync 340B sites to site registry
+                            if _stype.startswith("340B") and _sel_e.get("340B_ID"):
+                                _sr[_sid] = {
+                                    "340B ID":       _sel_e["340B_ID"],
+                                    "Covered entity": _sel_e["name"],
+                                }
+
+                            _imported += 1
+
+                        _save_entity_framework(_ef)
+                        _save_site_registry(_sr)
+                        _audit_log(f"Bulk imported {_imported} sites into {_sel_e.get('name', _sel_entity_label)}")
+                        st.success(f"✅ Imported {_imported} site(s) into {_sel_e.get('name', _sel_entity_label)}.")
+                        st.rerun()
+
+            except Exception as _upload_err:
+                st.error(f"Could not read file: {_upload_err}")
+
+        st.markdown("---")
         st.markdown("#### Import stores from current audit")
         st.caption(
             "Bulk-add all stores detected in the current audit as 340B sites for this entity. "
