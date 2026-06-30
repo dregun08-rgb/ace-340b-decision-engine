@@ -286,6 +286,118 @@ def _apply_exceptions(df: pd.DataFrame, exceptions: pd.DataFrame) -> pd.DataFram
     return df
 
 
+def apply_rule_exceptions(
+    df: pd.DataFrame,
+    rules: list[dict] | None = None,
+) -> pd.DataFrame:
+    """
+    Apply rule-based exceptions that automatically PASS or EXCEPTION claims
+    matching certain criteria — without needing to list individual Rx numbers.
+
+    Each rule is a dict with:
+        "name"       : Human-readable rule name
+        "column"     : Column to check (e.g. "Drug name", "PRICE SCHED", "Store number")
+        "operator"   : "contains", "equals", "starts_with", "ends_with", "not_contains",
+                       "in_list", "not_in_list"
+        "value"      : String or list to match against
+        "action"     : "PASS" or "EXCEPTION"
+        "reason"     : Why this rule applies (shown in Exception reason)
+        "skip_checks": Optional list of checks to override to PASS
+                       e.g. ["Prescriber check", "Prescriber address check"]
+
+    Built-in rules (always applied):
+    - Drug name contains '*' → retail fill → skip prescriber check (MAP format)
+
+    Returns the DataFrame with rules applied.
+    """
+    if "Rule exception flag" not in df.columns:
+        df["Rule exception flag"] = False
+        df["Rule exception reason"] = ""
+
+    # ── Built-in rules ────────────────────────────────────────────────────────
+
+    # MAP retail indicator: drug name ending with * means retail fill
+    # Retail fills can be dispensed by any provider — prescriber check should PASS
+    if "Drug name" in df.columns:
+        _retail_mask = df["Drug name"].fillna("").astype(str).str.strip().str.endswith("*")
+        if _retail_mask.any():
+            df.loc[_retail_mask, "Rule exception flag"] = True
+            df.loc[_retail_mask, "Rule exception reason"] = df.loc[_retail_mask, "Rule exception reason"].apply(
+                lambda x: (x + "; " if x else "") + "Retail fill (drug name contains *) — provider check waived"
+            )
+            # Override prescriber check and address check to PASS for retail fills
+            if "Prescriber check" in df.columns:
+                df.loc[_retail_mask, "Prescriber check"] = "PASS"
+            if "Prescriber address check" in df.columns:
+                df.loc[_retail_mask, "Prescriber address check"] = "PASS"
+
+    # ── User-defined rules ────────────────────────────────────────────────────
+    if rules:
+        for rule in rules:
+            col = rule.get("column", "")
+            op = rule.get("operator", "")
+            val = rule.get("value", "")
+            action = rule.get("action", "EXCEPTION")
+            reason = rule.get("reason", rule.get("name", "Rule exception"))
+            skip_checks = rule.get("skip_checks", [])
+
+            if col not in df.columns:
+                continue
+
+            col_vals = df[col].fillna("").astype(str).str.strip().str.upper()
+            val_upper = str(val).strip().upper() if isinstance(val, str) else val
+
+            # Build mask based on operator
+            if op == "contains":
+                mask = col_vals.str.contains(val_upper, na=False)
+            elif op == "equals":
+                mask = col_vals == val_upper
+            elif op == "starts_with":
+                mask = col_vals.str.startswith(val_upper, na=False)
+            elif op == "ends_with":
+                mask = col_vals.str.endswith(val_upper, na=False)
+            elif op == "not_contains":
+                mask = ~col_vals.str.contains(val_upper, na=False)
+            elif op == "in_list":
+                val_list = [v.strip().upper() for v in val.split(",")] if isinstance(val, str) else [str(v).upper() for v in val]
+                mask = col_vals.isin(val_list)
+            elif op == "not_in_list":
+                val_list = [v.strip().upper() for v in val.split(",")] if isinstance(val, str) else [str(v).upper() for v in val]
+                mask = ~col_vals.isin(val_list)
+            else:
+                continue
+
+            if mask.any():
+                df.loc[mask, "Rule exception flag"] = True
+                df.loc[mask, "Rule exception reason"] = df.loc[mask, "Rule exception reason"].apply(
+                    lambda x, r=reason: (x + "; " if x else "") + r
+                )
+                # Override specific checks to PASS
+                for check_col in skip_checks:
+                    if check_col in df.columns:
+                        df.loc[mask, check_col] = "PASS"
+                # Set overall status
+                if action == "PASS":
+                    df.loc[mask, "Overall status"] = "PASS"
+                elif action == "EXCEPTION":
+                    df.loc[mask & (df["Overall status"] == "REVIEW"), "Overall status"] = "EXCEPTION"
+
+    # ── Recalculate overall status for rule-excepted claims ───────────────────
+    # Claims where checks were overridden may now be all-PASS
+    _rule_affected = df["Rule exception flag"] == True
+    if _rule_affected.any():
+        _check_cols = [c for c in [
+            "NPI check", "NDC check", "Store map", "Entity map",
+            "Prescriber check", "Encounter date check", "Duplicate check",
+            "Prescriber address check"
+        ] if c in df.columns]
+        # If all checks are PASS and missing fields is 0, set to PASS
+        _all_pass = (df[_check_cols] == "PASS").all(axis=1) & (df.get("Missing fields", 0).astype(int) == 0)
+        df.loc[_rule_affected & _all_pass & (df["Overall status"] == "REVIEW"), "Overall status"] = "PASS"
+
+    return df
+
+
 # ── public API ────────────────────────────────────────────────────────────────
 
 def run_audit_from_workbook(
@@ -568,6 +680,10 @@ def audit_dataframe(
     else:
         df["Exception flag"]   = False
         df["Exception reason"] = ""
+
+    # ── apply rule-based exceptions (retail fills, user-defined rules) ────────
+    _rule_exceptions = rules.get("rule_exceptions", []) if rules else []
+    df = apply_rule_exceptions(df, rules=_rule_exceptions)
 
     # Override category / action for excepted claims
     exc_mask = df["Exception flag"]

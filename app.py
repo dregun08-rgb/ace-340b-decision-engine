@@ -1686,6 +1686,13 @@ entity_fw_json  = json.dumps(_entity_fw_raw) if _entity_fw_raw else None
 # Pass session encryption key so _load_results can decrypt the temp file
 _enc_key_hex    = st.session_state["_enc_key"].hex() if "_enc_key" in st.session_state else None
 
+# ── Inject custom rules into the rules dict ──────────────────────────────────
+_custom_rule_list = st.session_state.get("_custom_rules", [])
+if _custom_rule_list:
+    _rules_with_custom = json.loads(rules_json)
+    _rules_with_custom["rule_exceptions"] = _custom_rule_list
+    rules_json = json.dumps(_rules_with_custom)
+
 with st.spinner("Running decision engine…"):
     try:
         cached = _load_results(source_path, pm_json, mef_json, exc_json, rules_json,
@@ -2344,35 +2351,188 @@ with tab_store:
 # ── TAB 4: Exception Management ──────────────────────────────────────────────
 
 with tab_exc:
-    st.subheader("Exception management")
-    if exceptions_df is not None and not exceptions_df.empty:
-        st.success(f"{len(exceptions_df):,} exceptions loaded — matching REVIEW claims overridden to EXCEPTION.")
-        st.dataframe(exceptions_df, width="stretch", height=200)
-    else:
-        st.info(
-            "No exceptions file uploaded. Upload one via the sidebar to mark specific "
-            "Rx numbers as reviewed/approved."
+    st.subheader("Exception Management")
+
+    _exc_tab1, _exc_tab2, _exc_tab3 = st.tabs([
+        "📋 Rx Number Exceptions",
+        "⚙️ Rule-Based Exceptions",
+        "📄 Generate Draft",
+    ])
+
+    with _exc_tab1:
+        st.markdown("#### Rx Number Exceptions")
+        st.caption(
+            "Upload a CSV with specific prescription numbers to mark as reviewed/approved. "
+            "Matching REVIEW claims are overridden to EXCEPTION status."
+        )
+        if exceptions_df is not None and not exceptions_df.empty:
+            st.success(f"{len(exceptions_df):,} exceptions loaded — matching REVIEW claims overridden to EXCEPTION.")
+            st.dataframe(exceptions_df, use_container_width=True, height=200)
+        else:
+            st.info("No exceptions file uploaded. Upload via the sidebar under 📎 Supporting Files.")
+
+    with _exc_tab2:
+        st.markdown("#### Rule-Based Exceptions")
+        st.markdown("""
+        Define rules that automatically handle claims based on data patterns — no need 
+        to list individual Rx numbers.
+        """)
+
+        # Built-in rules status
+        st.markdown("##### Built-in Rules (always active)")
+
+        # Check if retail asterisk rule is firing
+        if "Drug name" in claims.columns:
+            _retail_count = claims["Drug name"].fillna("").astype(str).str.strip().str.endswith("*").sum()
+        else:
+            _retail_count = 0
+
+        st.markdown(f"""
+        | Rule | Condition | Action | Claims Affected |
+        |------|-----------|--------|----------------|
+        | **Retail Fill (MAP)** | Drug name ends with `*` | Skip prescriber check → PASS | {_retail_count:,} |
+        """)
+
+        if _retail_count > 0:
+            st.markdown(f"""
+            <div style='background:linear-gradient(135deg, #f0fdf4, #dcfce7);
+                 border:1px solid #86efac; border-left:4px solid #22c55e;
+                 border-radius:8px; padding:0.75rem 1.25rem; margin:0.5rem 0'>
+                <span style='color:#166534; font-weight:600'>
+                    ✅ {_retail_count:,} retail fills detected — prescriber check automatically waived for these claims
+                </span>
+            </div>
+            """, unsafe_allow_html=True)
+
+        # User-defined rules
+        st.markdown("---")
+        st.markdown("##### Custom Rules")
+        st.caption(
+            "Add your own rules. For example: if PRICE SCHED = 'FHC' (retail), "
+            "skip the prescriber check. Or if a specific store number is retail-only, "
+            "pass all claims from that store."
         )
 
-    st.markdown("**Generate exceptions draft from current REVIEW claims**")
-    st.caption("Fill in 'Reviewed by' and 'Review date', then re-upload as the exceptions CSV.")
-    if len(reviewed_claims) > 0:
-        exc_export = reviewed_claims[
-            [c for c in ["Prescription number", "Compliance category", "Risk score"] if c in reviewed_claims.columns]
-        ].copy()
-        exc_export.columns = (
-            ["Prescription number", "Exception reason", "Risk score"]
-            if "Compliance category" in reviewed_claims.columns
-            else exc_export.columns.tolist()
-        )
-        exc_export["Reviewed by"] = ""
-        exc_export["Review date"]  = ""
-        st.download_button(
-            "⬇ Download REVIEW claims as exceptions draft",
-            data=exc_export.to_csv(index=False).encode(),
-            file_name="ace_340b_exceptions_draft.csv",
-            mime="text/csv",
-        )
+        # Initialize custom rules in session state
+        if "_custom_rules" not in st.session_state:
+            st.session_state["_custom_rules"] = []
+
+        # Display existing rules
+        _custom_rules = st.session_state["_custom_rules"]
+        if _custom_rules:
+            for _ri, _rule in enumerate(_custom_rules):
+                _rcol1, _rcol2, _rcol3 = st.columns([4, 2, 1])
+                _rcol1.markdown(
+                    f"**{_rule['name']}** — `{_rule['column']}` {_rule['operator']} `{_rule['value']}` "
+                    f"→ {_rule['action']}"
+                )
+                _rcol2.caption(f"Skip: {', '.join(_rule.get('skip_checks', [])) or 'none'}")
+                if _rcol3.button("🗑", key=f"del_rule_{_ri}"):
+                    _custom_rules.pop(_ri)
+                    st.session_state["_custom_rules"] = _custom_rules
+                    st.rerun()
+
+        # Add new rule form
+        with st.expander("➕ Add a new rule", expanded=not _custom_rules):
+            _nr_c1, _nr_c2 = st.columns(2)
+            _nr_name = _nr_c1.text_input("Rule name", placeholder="e.g. Retail store 14 pass", key="_nr_name")
+            _available_cols = [c for c in claims.columns if not c.startswith("_")]
+            _nr_col = _nr_c2.selectbox("Column to check", _available_cols, key="_nr_col")
+
+            _nr_c3, _nr_c4 = st.columns(2)
+            _nr_op = _nr_c3.selectbox("Operator", [
+                "contains", "equals", "starts_with", "ends_with",
+                "not_contains", "in_list", "not_in_list"
+            ], key="_nr_op")
+            _nr_val = _nr_c4.text_input(
+                "Value (for in_list/not_in_list, comma-separate)",
+                placeholder="e.g. * or FHC or 14,15,16",
+                key="_nr_val",
+            )
+
+            _nr_c5, _nr_c6 = st.columns(2)
+            _nr_action = _nr_c5.selectbox("Action", ["PASS", "EXCEPTION"], key="_nr_action")
+            _nr_reason = _nr_c6.text_input("Reason", placeholder="e.g. Retail fill — non-340B store", key="_nr_reason")
+
+            _nr_skips = st.multiselect(
+                "Override these checks to PASS",
+                ["Prescriber check", "Prescriber address check", "Entity map",
+                 "Store map", "Encounter date check", "NPI check"],
+                default=[],
+                key="_nr_skips",
+            )
+
+            # Preview how many claims would match
+            if _nr_val and _nr_col:
+                _preview_vals = claims[_nr_col].fillna("").astype(str).str.strip().str.upper()
+                _pv = str(_nr_val).strip().upper()
+                if _nr_op == "contains":
+                    _preview_count = _preview_vals.str.contains(_pv, na=False).sum()
+                elif _nr_op == "equals":
+                    _preview_count = (_preview_vals == _pv).sum()
+                elif _nr_op == "starts_with":
+                    _preview_count = _preview_vals.str.startswith(_pv, na=False).sum()
+                elif _nr_op == "ends_with":
+                    _preview_count = _preview_vals.str.endswith(_pv, na=False).sum()
+                elif _nr_op == "not_contains":
+                    _preview_count = (~_preview_vals.str.contains(_pv, na=False)).sum()
+                elif _nr_op in ("in_list", "not_in_list"):
+                    _pv_list = [v.strip().upper() for v in _nr_val.split(",")]
+                    if _nr_op == "in_list":
+                        _preview_count = _preview_vals.isin(_pv_list).sum()
+                    else:
+                        _preview_count = (~_preview_vals.isin(_pv_list)).sum()
+                else:
+                    _preview_count = 0
+                st.caption(f"📊 This rule would affect **{_preview_count:,}** claims.")
+
+            if st.button("✅ Add rule", type="primary", key="_nr_add"):
+                if not _nr_name.strip() or not _nr_val.strip():
+                    st.error("Rule name and value are required.")
+                else:
+                    _custom_rules.append({
+                        "name": _nr_name.strip(),
+                        "column": _nr_col,
+                        "operator": _nr_op,
+                        "value": _nr_val.strip(),
+                        "action": _nr_action,
+                        "reason": _nr_reason.strip() or _nr_name.strip(),
+                        "skip_checks": _nr_skips,
+                    })
+                    st.session_state["_custom_rules"] = _custom_rules
+                    st.success(f"Rule '{_nr_name.strip()}' added. Re-run the audit to apply.")
+                    st.rerun()
+
+        if _custom_rules:
+            st.caption(
+                "⚠️ Custom rules are applied during the audit. If you just added a rule, "
+                "re-upload your data or refresh to re-run the audit with the new rules."
+            )
+
+    with _exc_tab3:
+        st.markdown("#### Generate Exceptions Draft")
+        st.caption("Download current REVIEW claims as a CSV. Fill in 'Reviewed by' and 'Review date', then re-upload.")
+        if len(reviewed_claims) > 0:
+            exc_export = reviewed_claims[
+                [c for c in ["Prescription number", "Compliance category", "Risk score"] if c in reviewed_claims.columns]
+            ].copy()
+            exc_export.columns = (
+                ["Prescription number", "Exception reason", "Risk score"]
+                if "Compliance category" in reviewed_claims.columns
+                else exc_export.columns.tolist()
+            )
+            exc_export["Reviewed by"] = ""
+            exc_export["Review date"]  = ""
+            st.dataframe(exc_export.head(20), use_container_width=True, height=200)
+            st.download_button(
+                "⬇ Download REVIEW claims as exceptions draft",
+                data=exc_export.to_csv(index=False).encode(),
+                file_name="ace_340b_exceptions_draft.csv",
+                mime="text/csv",
+                key="dl_exc_draft",
+            )
+        else:
+            st.info("No REVIEW claims to export.")
 
 
 # ── TAB: Provider Referral Queue ─────────────────────────────────────────────
