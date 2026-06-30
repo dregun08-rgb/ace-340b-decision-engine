@@ -127,17 +127,17 @@ if "_last_activity" not in st.session_state:
 _inactive_secs = _NOW - st.session_state["_last_activity"]
 st.session_state["_last_activity"] = _NOW  # reset on every run (= every user interaction)
 
-if _inactive_secs > 1800:  # 30-minute auto-expire
+if _inactive_secs > 3600:  # 60-minute auto-expire
     for _tp in st.session_state.get("_temp_files", []):
         _secure_delete(_tp)
     st.session_state.clear()
     st.warning(
-        "🔒 **HIPAA Security:** Your session expired after 30 minutes of inactivity. "
+        "🔒 **HIPAA Security:** Your session expired after 60 minutes of inactivity. "
         "All uploaded data has been securely cleared. Please refresh the page to start a new session."
     )
     st.stop()
-elif _inactive_secs > 1200:  # 20-minute warning
-    _mins_left = max(1, int((1800 - _inactive_secs) // 60) + 1)
+elif _inactive_secs > 3000:  # 50-minute warning
+    _mins_left = max(1, int((3600 - _inactive_secs) // 60) + 1)
     st.warning(
         f"🔒 **HIPAA Security:** Session will auto-expire in ~{_mins_left} minute(s) due to inactivity. "
         "Save your work."
@@ -147,7 +147,7 @@ elif _inactive_secs > 1200:  # 20-minute warning
 # ── HIPAA notice (compact) ────────────────────────────────────────────────────
 st.success(
     "🔒 **HIPAA-Secured** — AES-256 encryption at rest · No PHI retained between sessions · "
-    "30-min auto-expire · Use under signed BAA only.",
+    "60-min auto-expire · Use under signed BAA only.",
     icon=None,
 )
 
@@ -720,7 +720,7 @@ with st.sidebar.expander("🔒 Security & Session", expanded=False):
         "The encryption key is unique to this browser session and never written to disk."
     )
     _mins_inactive = int(_inactive_secs // 60)
-    _mins_remain   = max(0, 30 - _mins_inactive)
+    _mins_remain   = max(0, 60 - _mins_inactive)
     st.caption(
         f"Session auto-expires in ~{_mins_remain} min · "
         f"Inactive for {_mins_inactive} min"
