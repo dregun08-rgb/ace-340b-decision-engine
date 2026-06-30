@@ -3,13 +3,19 @@ ace_340b_audit/ingest.py
 ------------------------
 Adapters for pharmacy dispensing / EHR prescription export files.
 
-Two adapters are provided:
+Three adapters are provided:
 
-1. RX-log adapter (legacy proprietary format)
+1. RX-log adapter (Southside / legacy proprietary format)
    Detects the strict RX-log column schema and maps it to engine-canonical
    column names.  Required: RXNBR, FILLDATE, DRUG NAME, NDC, RX STOREID, DR NPI.
 
-2. Generic dispense log adapter (flexible EHR/pharmacy exports)
+2. MAP / multi-location adapter (TX-, DG-, DR-, PD- prefixed columns)
+   Detects pharmacy systems that use prefix-based naming such as
+   TX-Rx Number, TX-Date Filled, DG-Drug Name, DG-NDC Nbr,
+   DR-Doctor NPI#, RX-Store Number, PD-Pat Combined Name, etc.
+   Common in multi-entity 340B covered entities (e.g. MAP Health).
+
+3. Generic dispense log adapter (flexible EHR/pharmacy exports)
    Handles any CSV or Excel export from an EHR or pharmacy system that
    includes patient, drug, date, and location information under various
    column name conventions (e.g. "Patient", "Medication", "Effective Date",
@@ -22,7 +28,10 @@ from __future__ import annotations
 
 import pandas as pd
 
-# ── column mapping: source → engine canonical ─────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# FORMAT 1: Southside / legacy RX-log
+# ══════════════════════════════════════════════════════════════════════════════
+
 _COLUMN_MAP: dict[str, str] = {
     "RXNBR":    "Prescription number",
     "FILLDATE": "Fill date",
@@ -51,13 +60,74 @@ _COLUMN_MAP: dict[str, str] = {
     "PATZIP":   "Patient zip",
 }
 
-# Columns that must be present for a file to be treated as an RX log
 _SIGNATURE_COLS = {"RXNBR", "FILLDATE", "DRUG NAME", "NDC", "RX STOREID", "DR NPI"}
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# FORMAT 2: MAP / multi-location (TX-, DG-, DR-, PD- prefixed)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_MAP_COLUMN_MAP: dict[str, str] = {
+    "TX-Rx Number":         "Prescription number",
+    "TX-Date Filled":       "Fill date",
+    "DG-Drug Name 27":      "Drug name",
+    "DG-Drug Name":         "Drug name",
+    "DG-NDC Nbr":           "NDC",
+    "DG-NDC":               "NDC",
+    "DR-Doctor NPI#":       "Provider NPI",
+    "DR-Doctor NPI":        "Provider NPI",
+    "DR-Doctor Name(25)":   "Prescribing provider",
+    "DR-Doctor Name":       "Prescribing provider",
+    "DR-Doctor Address":    "Provider address",
+    "RX-Store Number":      "Store number",
+    "RX-Store Nbr":         "Store number",
+    "PD-Pat Combined Name": "Patient name",
+    "PD-Patient Name":      "Patient name",
+    "PD-Patient Birthdate": "Patient DOB",
+    "PD-Patient DOB":       "Patient DOB",
+    "PD-Patient Zip":       "Patient zip",
+    "PD-Patient State":     "Patient state",
+    "PD-Patient Gender":    "Patient gender",
+    # Payer columns (MAP format)
+    "TP-Plan Name":         "Primary payer",
+    "TP-Plan ID":           "Primary payer ID",
+    "TP-Primary Plan":      "Primary payer",
+    # Date written
+    "TX-Date Written":      "Encounter date",
+    "TX-Written Date":      "Encounter date",
+    # Additional MAP fields
+    "TX-Refill Number":     "Refill",
+    "TX-Qty Dispensed":     "Qty dispensed",
+    "TX-Price":             "Rx price",
+    "TX-Cost":              "Rx cost",
+    "DG-DEA Class":         "DEA class",
+    "DR-DEA Number":        "Prescriber DEA",
+}
+
+# Minimum columns to detect MAP format (need at least 3)
+_MAP_SIGNATURE_PREFIXES = {"TX-", "DG-", "DR-", "PD-", "RX-"}
+
+
 def detect_rx_log(df: pd.DataFrame) -> bool:
-    """Return True if *df* has the RX-log column signature."""
+    """Return True if *df* has the Southside RX-log column signature."""
     return _SIGNATURE_COLS.issubset(set(df.columns))
+
+
+def detect_map_format(df: pd.DataFrame) -> bool:
+    """Return True if *df* uses the MAP / multi-location column naming.
+    
+    Detects columns with TX-, DG-, DR-, PD-, RX- prefixes commonly used
+    by QS/1, Computer-Rx, PioneerRx, and similar pharmacy systems in
+    multi-entity 340B environments.
+    """
+    cols = set(df.columns)
+    # Check for known MAP columns
+    known_matches = sum(1 for c in cols if c in _MAP_COLUMN_MAP)
+    if known_matches >= 3:
+        return True
+    # Fallback: check for prefix pattern
+    prefix_counts = sum(1 for c in cols if any(c.startswith(p) for p in _MAP_SIGNATURE_PREFIXES))
+    return prefix_counts >= 4
 
 
 def map_rx_log(
@@ -167,6 +237,113 @@ def map_rx_log(
 
     # ── Site_Entity_Map: minimal — entity match will be REVIEW until user
     #    populates 340B ID / Covered entity via the Site Registry tab ──────────
+    site_entity_map = pd.DataFrame({
+        "Site location":                stores,
+        "Valid patient encounter site": stores,
+        "Active Y/N":                   ["Y"] * len(stores),
+    })
+
+    return raw, store_map, site_entity_map
+
+
+def map_map_format(
+    df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Transform a MAP / multi-location pharmacy DataFrame into the three
+    DataFrames expected by ``audit_dataframe()``.
+
+    Handles column naming like TX-Rx Number, DG-Drug Name 27,
+    DR-Doctor NPI#, PD-Pat Combined Name, RX-Store Number, etc.
+
+    Also auto-detects any unmapped columns with recognized prefixes and
+    preserves them for downstream use.
+    """
+    # Rename known columns to canonical names
+    rename = {k: v for k, v in _MAP_COLUMN_MAP.items() if k in df.columns}
+    raw = df.rename(columns=rename)
+
+    # ── Ensure critical columns exist ────────────────────────────────────────
+
+    # Fill date: use TX-Date Filled (already mapped) or first TX-Date* column
+    if "Fill date" not in raw.columns:
+        for c in df.columns:
+            if c.startswith("TX-") and "date" in c.lower():
+                raw["Fill date"] = df[c]
+                break
+
+    # Encounter date: if no WRITTEN/TX-Date Written, copy from Fill date
+    if "Encounter date" not in raw.columns and "Fill date" in raw.columns:
+        raw["Encounter date"] = raw["Fill date"]
+
+    # NDC: ensure string format, remove decimals
+    if "NDC" in raw.columns:
+        raw["NDC"] = raw["NDC"].astype(str).str.replace(r"\.0$", "", regex=True)
+
+    # Provider NPI: ensure string format, remove decimals from float conversion
+    if "Provider NPI" in raw.columns:
+        raw["Provider NPI"] = (
+            raw["Provider NPI"]
+            .fillna("")
+            .astype(str)
+            .str.replace(r"\.0$", "", regex=True)
+            .str.strip()
+        )
+
+    # Store number: ensure string
+    if "Store number" in raw.columns:
+        raw["Store number"] = raw["Store number"].astype(str).str.replace(r"\.0$", "", regex=True).str.strip()
+
+    # Patient name: already mapped from PD-Pat Combined Name
+    # May be in "LAST, FIRST" or "LAST***, FIRST" format — clean up
+    if "Patient name" in raw.columns:
+        raw["Patient name"] = (
+            raw["Patient name"]
+            .fillna("")
+            .astype(str)
+            .str.replace(r"\*+", "", regex=True)  # remove privacy asterisks
+            .str.strip()
+        )
+
+    # Prescribing provider: already mapped from DR-Doctor Name
+    # May be in "LAST, FIRST" format — keep as-is for display
+
+    # ── Parse dates ──────────────────────────────────────────────────────────
+    for col in ("Fill date", "Encounter date", "Patient DOB"):
+        if col in raw.columns:
+            raw[col] = pd.to_datetime(raw[col], errors="coerce")
+
+    # ── Per-store address from DR-Doctor Address ─────────────────────────────
+    _store_addr: dict[str, str] = {}
+    if "Store number" in raw.columns and "Provider address" in raw.columns:
+        for sid, grp in raw.groupby("Store number"):
+            addr = grp["Provider address"].dropna().astype(str).str.strip()
+            addr = addr[addr != ""].head(1)
+            _store_addr[str(sid)] = addr.iloc[0] if len(addr) > 0 else str(sid)
+    elif "Store number" in raw.columns:
+        for sid in raw["Store number"].unique():
+            _store_addr[str(sid)] = str(sid)
+
+    # ── Store_Map ────────────────────────────────────────────────────────────
+    stores = (
+        raw["Store number"]
+        .dropna()
+        .astype(str)
+        .str.strip()
+        .replace("", pd.NA)
+        .dropna()
+        .unique()
+        .tolist()
+    )
+    store_map = pd.DataFrame({
+        "Store number":           stores,
+        "Pharmacy location":      [_store_addr.get(s, s) for s in stores],
+        "Site location":          stores,
+        "Patient encounter site": stores,
+        "Entity site address":    [_store_addr.get(s, s) for s in stores],
+    })
+
+    # ── Site_Entity_Map ──────────────────────────────────────────────────────
     site_entity_map = pd.DataFrame({
         "Site location":                stores,
         "Valid patient encounter site": stores,

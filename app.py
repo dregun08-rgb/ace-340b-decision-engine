@@ -21,7 +21,7 @@ import streamlit as st
 from cryptography.fernet import Fernet
 
 from ace_340b_audit.engine import run_audit_from_workbook, audit_dataframe
-from ace_340b_audit.ingest import detect_rx_log, map_rx_log, looks_like_ehr
+from ace_340b_audit.ingest import detect_rx_log, detect_map_format, map_rx_log, map_map_format, looks_like_ehr
 from ace_340b_audit.rules import DEFAULT_RULES, load_rules, save_rules
 from ace_340b_audit.decisions import (
     CATEGORIES, CATEGORY_COLORS, CATEGORY_DESCRIPTIONS, SEVERITY,
@@ -855,7 +855,12 @@ if uploaded_file is not None:
                 _px = pd.ExcelFile(_io.BytesIO(wb_bytes))
                 if "Raw_Data" not in _px.sheet_names and _px.sheet_names:
                     _pdf = _px.parse(_px.sheet_names[0], nrows=3, dtype=str)
-                    _fmt = "excel_rxlog" if detect_rx_log(_pdf) else "excel"
+                    if detect_rx_log(_pdf):
+                        _fmt = "excel_rxlog"
+                    elif detect_map_format(_pdf):
+                        _fmt = "excel_rxlog"  # same path, map_map_format handles internally
+                    else:
+                        _fmt = "excel"
                 else:
                     _fmt = "excel"
             except Exception:
@@ -1577,6 +1582,16 @@ def _load_results(path, pm_json, mef_json, exc_json, rules_json, carve,
             rules=rules, carve_status=carve,
         )
 
+    def _audit_map_format(raw_df):
+        """Map MAP/multi-location columns → canonical, apply framework+registry, run engine."""
+        raw_df, sm_df, se_df = map_map_format(raw_df)
+        sm_df, se_df, raw_df = _apply_entity_and_site_reg(sm_df, se_df, raw_df)
+        return audit_dataframe(
+            raw=raw_df, store_map=sm_df, site_entity_map=se_df,
+            provider_master=pm, mef=mef, exceptions=exc,
+            rules=rules, carve_status=carve,
+        )
+
     def _to_object(df):
         """Convert all columns to plain object dtype (avoids PyArrow issues on Cloud)."""
         return df.astype({c: object for c in df.columns})
@@ -1586,36 +1601,44 @@ def _load_results(path, pm_json, mef_json, exc_json, rules_json, carve,
 
     if fmt == "csv":
         raw_df = _to_object(pd.read_csv(_src, dtype=str, low_memory=False))
-        if not detect_rx_log(raw_df):
-            if looks_like_ehr(raw_df):
-                raise ValueError(
-                    "EHR_FILE_DETECTED: This file appears to be an EHR patient/encounter "
-                    "export (columns: " + ", ".join(raw_df.columns[:8].tolist()) + ", ...). "
-                    "Upload it using the EHR Encounter Data section in the sidebar, "
-                    "not the main claims file slot."
-                )
+        if detect_rx_log(raw_df):
+            res = _audit_rxlog(raw_df)
+        elif detect_map_format(raw_df):
+            res = _audit_map_format(raw_df)
+        elif looks_like_ehr(raw_df):
             raise ValueError(
-                "CSV does not match the expected RX-log format. "
-                "Required columns: RXNBR, FILLDATE, DRUG NAME, NDC, RX STOREID, DR NPI."
+                "EHR_FILE_DETECTED: This file appears to be an EHR patient/encounter "
+                "export (columns: " + ", ".join(raw_df.columns[:8].tolist()) + ", ...). "
+                "Upload it using the EHR Encounter Data section in the sidebar, "
+                "not the main claims file slot."
             )
-        res = _audit_rxlog(raw_df)
+        else:
+            raise ValueError(
+                "CSV does not match a recognized pharmacy format. "
+                "Supported: Southside RX-log (RXNBR, FILLDATE, ...) or "
+                "MAP/multi-location (TX-Rx Number, DG-Drug Name, ...)."
+            )
 
     elif fmt == "excel_rxlog":
-        # Excel file whose first sheet is an RX-log (e.g. rxlog_20260501092518)
+        # Excel file whose first sheet is an RX-log or MAP format
         _xl  = pd.ExcelFile(_src)
         raw_df = _to_object(_xl.parse(_xl.sheet_names[0], dtype=str))
-        if not detect_rx_log(raw_df):
-            if looks_like_ehr(raw_df):
-                raise ValueError(
-                    "EHR_FILE_DETECTED: This file appears to be an EHR patient/encounter "
-                    "export. Upload it using the EHR Encounter Data section in the sidebar, "
-                    "not the main claims file slot."
-                )
+        if detect_rx_log(raw_df):
+            res = _audit_rxlog(raw_df)
+        elif detect_map_format(raw_df):
+            res = _audit_map_format(raw_df)
+        elif looks_like_ehr(raw_df):
             raise ValueError(
-                f"Excel sheet '{_xl.sheet_names[0]}' does not match the RX-log format. "
-                "Required columns: RXNBR, FILLDATE, DRUG NAME, NDC, RX STOREID, DR NPI."
+                "EHR_FILE_DETECTED: This file appears to be an EHR patient/encounter "
+                "export. Upload it using the EHR Encounter Data section in the sidebar, "
+                "not the main claims file slot."
             )
-        res = _audit_rxlog(raw_df)
+        else:
+            raise ValueError(
+                f"Excel sheet '{_xl.sheet_names[0]}' does not match a recognized format. "
+                "Supported: Southside RX-log (RXNBR, FILLDATE, ...) or "
+                "MAP/multi-location (TX-Rx Number, DG-Drug Name, ...)."
+            )
 
     else:  # standard 340B workbook
         if _use_bio is not None:
