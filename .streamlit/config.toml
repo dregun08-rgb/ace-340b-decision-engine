@@ -1,10 +1,13 @@
 [server]
-maxUploadSize = 200
-maxMessageSize = 200
+maxUploadSize = 50
+maxMessageSize = 50
+runOnSave = false
 
 [runner]
-# Garbage collect aggressively
 fastReruns = true
 
 [browser]
 gatherUsageStats = false
+
+[client]
+showErrorDetails = true
